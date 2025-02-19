@@ -1,5 +1,5 @@
 import argparse
-from DeepTranserGAN import predict_live, predict
+from DeepTranserGAN import predict
 
 
 def parse_args():
@@ -21,6 +21,10 @@ def parse_args():
                         help="where to save your data")  # 保存位置
     parser.add_argument("--sample_interval", type=int,
                         default=10, help="how often to sample the img")
+    parser.add_argument("video", type=bool, default=False,
+                        help="whether to use video")
+    parser.add_argument("save_video", type=bool, default=False,
+                        help="whether to save the video")
     opt = parser.parse_args()
     print(opt)
     return opt
@@ -28,8 +32,5 @@ def parse_args():
 
 if __name__ == '__main__':
     opt = parse_args()
-    if opt.data == '0':
 
-        predict_live(opt)
-    else:
-        predict(opt)
+    predict(opt)

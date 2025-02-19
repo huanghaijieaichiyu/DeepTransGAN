@@ -1,4 +1,21 @@
-import dis
+'''
+code by 黄小海  2025/2/19
+
+这是一个基于PyTorch的深度学习项目，用于低光照图像增强。
+数据集结构：
+- datasets
+    - kitti_LOL
+        - eval15
+            - high
+            - low
+        - our485
+            - high
+            - low
+- DeepTranserGAN
+
+
+
+'''
 import os
 import time
 import cv2
@@ -52,15 +69,18 @@ class BaseTrainer:
         self.g_loss = get_loss(args.loss).to(
             self.device) if args.loss else nn.MSELoss().to(self.device)
         self.stable_loss = nn.MSELoss().to(self.device)
+        self.path = save_path(args.save_path)
         self.log = tensorboard.writer.SummaryWriter(log_dir=self.args.save_path, filename_suffix=str(args.epochs),
                                                     flush_secs=180)
-        self.path = save_path(args.save_path)
-        os.makedirs(os.path.join(self.path, 'generator'), exist_ok=True)
-        if self.discriminator is not None:
-            os.makedirs(os.path.join(
-                self.path, 'discriminator'), exist_ok=True)
-        if self.critic is not None:
-            os.makedirs(os.path.join(self.path, 'critic'), exist_ok=True)
+
+        # 确保路径存在
+        if self.args.resume == '':
+            os.makedirs(os.path.join(self.path, 'generator'), exist_ok=True)
+            if self.discriminator is not None:
+                os.makedirs(os.path.join(
+                    self.path, 'discriminator'), exist_ok=True)
+            if self.critic is not None:
+                os.makedirs(os.path.join(self.path, 'critic'), exist_ok=True)
         self.train_log = self.path + '/log.txt'
         self.args_dict = args.__dict__
         self.epoch = 0
@@ -167,7 +187,7 @@ class BaseTrainer:
         self.load_checkpoint()
         while self.epoch < self.args.epochs:
             self.train_epoch()
-            if (self.epoch + 1) % 100 == 0 and (self.epoch + 1) >= 100:
+            if (self.epoch + 1) % 10 == 0 and (self.epoch + 1) >= 10:
                 self.evaluate_model()
             self.epoch += 1
         self.log.close()
@@ -306,33 +326,19 @@ class WGAN_GPTrainer(BaseTrainer):
                                      % (self.epoch + 1, self.args.epochs, i + 1, len(self.train_loader),
                                         loss_critic.item(), loss_generator.item(), g_z))
                 self.save_checkpoint()
-        train_log_txt_formatter = (
-            '{time_str} \t [Epoch] \t {epoch:03d} \t [gLoss] \t {gloss_str} \t [cLoss] \t {closs_str} \t [Dx] \t {Dx_str} \t ['
-            'Gz] \t {Gz_str}\n')
-        to_write = train_log_txt_formatter.format(time_str=time.strftime("%Y_%m_%d_%H:%M:%S"), epoch=self.epoch + 1,
-                                                  gloss_str=" ".join(
-                                                      ["{:4f}".format(np.mean(gen_loss))]),
-                                                  closs_str=" ".join(
-                                                      ["{:4f}".format(np.mean(critic_loss))]),
-                                                  Dx_str="N/A", Gz_str=" ".join(["{:4f}".format(g_z)]))
-        with open(self.train_log, "a") as f:
-            f.write(to_write)
+        self.write_log(self.epoch, gen_loss, critic_loss, 0, 0, g_z)
         high_images = high_images.to(self.device)
         fake_images = fake_images.to(self.device)
-        self.log.add_scalar('generation loss',
-                            np.mean(gen_loss), self.epoch + 1)
-        self.log.add_scalar('critic loss', np.mean(
-            critic_loss), self.epoch + 1)
-        self.log.add_scalar('learning rate', self.g_optimizer.state_dict()[
-                            'param_groups'][0]['lr'], self.epoch + 1)
-        self.log.add_images('real', high_images, self.epoch + 1)
-        self.log.add_images('fake', fake_images, self.epoch + 1)
+        self.visualize_results(self.epoch, gen_loss,
+                               critic_loss, high_images, fake_images)
 
 
 def train(args):
     generator = Generator(args.depth, args.weight)
     discriminator = Discriminator(
         batch_size=args.batch_size, img_size=args.img_size[0])
+    model_structure(generator, (3, args.img_size[0], args.img_size[1]))
+    model_structure(discriminator, (3, args.img_size[0], args.img_size[1]))
     trainer = StandardGANTrainer(args, generator, discriminator)
     trainer.train()
 
@@ -340,119 +346,155 @@ def train(args):
 def train_WGAN(args):
     generator = Generator(args.depth, args.weight)
     critic = Critic()
+    model_structure(generator, (3, args.img_size[0], args.img_size[1]))
+    model_structure(critic, (3, args.img_size[0], args.img_size[1]))
     trainer = WGAN_GPTrainer(args, generator, critic)
     trainer.train()
 
 
-def predict(self):
-    # 防止同名覆盖
-    path = save_path(self.save_path, model='predict')
-    # 数据准备
-    if self.device == 'cuda':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class BasePredictor:
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device('cpu')
+        if args.device == 'cuda':
+            self.device = torch.device(
+                'cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.img_size = args.img_size
+        self.data = args.data
+        self.model = args.model
+        self.batch_size = args.batch_size
+        self.num_workers = args.num_workers
+        self.save_path = args.save_path
+        self.generator = Generator()
+        model_structure(
+            self.generator, (3, self.img_size[0], self.img_size[1]))
+        checkpoint = torch.load(self.model)
+        self.generator.load_state_dict(checkpoint['net'])
+        self.generator.to(self.device)
+        self.generator.eval()
+        self.transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((self.img_size[0], self.img_size[1])),
+            transforms.ToTensor(),
+            # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+
+    def predict_images(self):
+        raise NotImplementedError
+
+    def predict_video(self):
+        raise NotImplementedError
+
+
+class ImagePredictor(BasePredictor):
+    def __init__(self, args):
+        super().__init__(args)
+        self.test_data = LowLightDataset(
+            image_dir=self.data, transform=self.transform, phase="test")
+        self.test_loader = DataLoader(self.test_data,
+                                      batch_size=self.batch_size,
+                                      num_workers=self.num_workers,
+                                      drop_last=True)
+
+    def predict_images(self):
+        # 防止同名覆盖
+        path = save_path(self.save_path, model='predict')
+        img_pil = transforms.ToPILImage()
+        pbar = tqdm(enumerate(self.test_loader), total=len(self.test_loader), bar_format='{l_bar}{bar:10}| {n_fmt}/{'
+                    'total_fmt} {elapsed}')
+        torch.no_grad()
+        i = 0
+        if not os.path.exists(os.path.join(path, 'predictions')):
+            os.makedirs(os.path.join(path, 'predictions'))
+        for i, (low_images, high_images) in pbar:
+            lamb = 255.  # 取绝对值最大值，避免负数超出索引
+            low_images = low_images.to(self.device) / lamb
+            high_images = high_images.to(self.device) / lamb
+
+            fake = self.generator(low_images)
+            for j in range(self.batch_size):
+                fake_img = np.array(
+                    img_pil(fake[j]), dtype=np.float32)
+
+                if i > 10 and i % 10 == 0:  # 图片太多，十轮保存一次
+                    img_save_path = os.path.join(
+                        path, 'predictions', str(i) + '.jpg')
+                    cv2.imwrite(img_save_path, fake_img)
+                i = i + 1
+            pbar.set_description('Processed %d images' % i)
+        pbar.close()
+
+    def predict_video(self):
+        raise NotImplementedError  # 该类不支持视频预测
+
+
+class VideoPredictor(BasePredictor):
+    def __init__(self, args):
+        super().__init__(args)
+        self.save_video = args.save_video
+        self.video_path = args.video_path
+
+    def predict_images(self):
+        raise NotImplementedError  # 该类不支持图片预测
+
+    def predict_video(self):
+        if self.device == 'cuda':
+            device = torch.device(
+                'cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device('cpu')
+        cap = cv2.VideoCapture(self.video_path)  # 读取图像
+        if not cap.isOpened():
+            raise IOError("Cannot open video source")
+
+        fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+        if self.save_video:
+            write = cv2.VideoWriter(self.save_path + '/fake.mp4', fourcc, cap.get(cv2.CAP_PROP_FPS),
+                                    [640, 480])
+        else:
+            write = None
+
+        torch.no_grad()
+        if not os.path.exists(os.path.join(self.save_path, 'predictions')):
+            os.makedirs(os.path.join(self.save_path, 'predictions'))
+        while cap.isOpened():
+            _, frame = cap.read()
+            if frame is None:
+                break
+            frame = cv2.resize(frame, (640, 480))
+            frame_pil = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_pil = torch.tensor(np.array(
+                frame_pil, np.float32) / 255., dtype=torch.float32).to(device)  # 转为tensor
+            frame_pil = torch.unsqueeze(frame_pil, 0).permute(
+                0, 3, 1, 2)  # 提升维度--转换维度
+            fake = self.generator(frame_pil)
+            fake = fake.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
+            cv2.imshow('fake', fake)
+
+            cv2.imshow('origin', frame)
+
+            if self.save_video:
+                # 写入文件
+                # float转uint8 fake[0,1]转[0,255]
+                fake_uint8 = (fake * 255).astype(np.uint8)
+                write.write(fake_uint8)
+
+            key = cv2.waitKey(1)
+            if key == 27:
+                cv2.destroyAllWindows()
+                break
+        cap.release()
+        if self.save_video:
+            write.release()
+
+
+def predict(args):
+    if args.video:
+        predictor = VideoPredictor(args)
+        predictor.predict_video()
     else:
-        device = torch.device('cpu')
-
-    model = Generator()
-    model_structure(model, (3, self.img_size[0], self.img_size[1]))
-    checkpoint = torch.load(self.model)
-    model.load_state_dict(checkpoint['net'])
-    model.to(device)
-
-    transform = transforms.Compose([
-        transforms.ToPILImage(),  # 先转换为PIL Image, 因为一些transform需要PIL Image作为输入
-        transforms.Resize((256, 256)),  # 可选：调整大小
-        transforms.ToTensor(),          # 转换为Tensor
-        # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # 可选：归一化
-    ])  # 图像转换
-    test_data = LowLightDataset(
-        image_dir=self.data, transform=transform, phase="test")
-    img_pil = transforms.ToPILImage()
-    test_loader = DataLoader(test_data,
-                             batch_size=self.batch_size,
-                             num_workers=self.num_workers,
-                             drop_last=True)
-    pbar = tqdm(enumerate(test_loader), total=len(test_loader), bar_format='{l_bar}{bar:10}| {n_fmt}/{'
-                                                                           'total_fmt} {elapsed}')
-    model.eval()
-    torch.no_grad()
-    i = 0
-    if not os.path.exists(os.path.join(path, 'predictions')):
-        os.makedirs(os.path.join(path, 'predictions'))
-    for i, (low_images, high_images) in pbar:
-
-        lamb = 255.  # 取绝对值最大值，避免负数超出索引
-        low_images = low_images.to(device) / lamb
-        high_images = high_images.to(device) / lamb
-
-        fake = model(low_images)
-        for j in range(self.batch_size):
-
-            fake_img = np.array(
-                img_pil(fake[j]), dtype=np.float32)
-
-            if i > 10 and i % 10 == 0:  # 图片太多，十轮保存一次
-                img_save_path = os.path.join(
-                    path, 'predictions', str(i) + '.jpg')
-                cv2.imwrite(img_save_path, fake_img)
-            i = i + 1
-        pbar.set_description('Processed %d images' % i)
-    pbar.close()
-
-
-def predict_live(self):
-    if self.device == 'cuda':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device('cpu')
-    model = Generator(1, 1)
-    model_structure(model, (3, self.img_size[0], self.img_size[1]))
-    checkpoint = torch.load(self.model)
-    model.load_state_dict(checkpoint['net'])
-    model.to(device)
-    cap = cv2.VideoCapture('test_dark_countryard.mp4')  # 读取图像
-    fourcc = cv2.VideoWriter.fourcc(*'mp4v')
-    write = cv2.VideoWriter()
-    write.open(self.save_path + '/fake.mp4', fourcc=fourcc, fps=cap.get(cv2.CAP_PROP_FPS), isColor=True,
-               frameSize=[640, 480])
-
-    frame_buffer = []
-    batch_size = 4  # 根据显存调整
-
-    model.eval()
-    torch.no_grad()
-    if not os.path.exists(os.path.join(self.save_path, 'predictions')):
-        os.makedirs(os.path.join(self.save_path, 'predictions'))
-    while cap.isOpened():
-        _, frame = cap.read()
-        _, frame = cap.read()
-        frame_pil = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        '''# 是否需要resize取决于新图片格式与训练时的是否一致
-        frame_pil = cv2.resize(frame_pil, self.img_size)
-        # 是否需要resize取决于新图片格式与训练时的是否一致
-        frame_pil = cv2.resize(frame_pil, self.img_size)'''
-
-        frame_pil = torch.tensor(np.array(
-            frame_pil, np.float32) / 255., dtype=torch.float32).to(device)  # 转为tensor
-        frame_pil = torch.unsqueeze(frame_pil, 0).permute(
-            0, 3, 1, 2)  # 提升维度--转换维度
-        fake = model(frame_pil)
-        fake = fake.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
-        # fake = cv2.resize(fake, (640, 480))  # 维度还没降下来
-        cv2.imshow('fake', fake)
-
-        cv2.imshow('origin', frame)
-
-        # 写入文件
-        # float转uint8 fake[0,1]转[0,255]
-        write.write(fake)
-
-        key = cv2.waitKey(1)
-        if key == 27:
-            cv2.destroyAllWindows()
-            break
-    cap.release()
-    write.release()
+        predictor = ImagePredictor(args)
+        predictor.predict_images()
 
 
 def compute_gradient_penalty(critic, real_samples, fake_samples):
@@ -460,7 +502,7 @@ def compute_gradient_penalty(critic, real_samples, fake_samples):
     alpha = torch.rand((real_samples.size(
         0), 1, 1, 1), device=real_samples.device)  # 形状是 (batch_size, 1, 1, 1)  适配图像形状
     interpolates = (alpha * real_samples + ((1 - alpha)
-                    * fake_samples)).requires_grad_(True)
+                                            * fake_samples)).requires_grad_(True)
 
     critic_interpolates = critic(interpolates)
 

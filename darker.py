@@ -1,9 +1,7 @@
 import cv2
 import os
 import numpy as np
-from sympy import im
 from tqdm import tqdm
-import colorsys
 
 
 def darker(data_dir, ratio=0.5, phase="train"):
