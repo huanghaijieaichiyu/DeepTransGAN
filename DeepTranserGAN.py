@@ -37,7 +37,7 @@ class BaseTrainer:
             transforms.ToPILImage(),
             transforms.Resize((args.img_size[0], args.img_size[1])),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         self.train_data = LowLightDataset(
             image_dir=args.data, transform=self.transform, phase="train")
@@ -68,7 +68,7 @@ class BaseTrainer:
         self.PSN = [0.]
 
     def load_checkpoint(self):
-        if self.args.resume:
+        if self.args.resume != '':
             g_path_checkpoint = os.path.join(
                 self.args.resume, 'generator/last.pt')
             g_checkpoint = torch.load(g_path_checkpoint)
@@ -86,6 +86,8 @@ class BaseTrainer:
                     d_checkpoint['net']) if self.critic else None
             self.d_optimizer.load_state_dict(d_checkpoint['optimizer'])
             print(f'继续第：{self.epoch + 1}轮训练')
+            # 继续训练时，不需要再次设置路径
+            self.path = self.args.resume
             self.args.resume = ''
 
     def save_checkpoint(self):
@@ -148,9 +150,9 @@ class BaseTrainer:
                     d_checkpoint = {'net': self.discriminator.state_dict() if self.discriminator else self.critic.state_dict(),  # type: ignore
                                     'optimizer': self.d_optimizer.state_dict(), 'epoch': self.epoch}
                     torch.save(g_checkpoint, os.path.join(
-                        self.path, '/generator/best.pt'))
-                    torch.save(d_checkpoint, os.path.join(self.path, '/discriminator/best.pt')
-                               if self.discriminator else os.path.join(self.path, '/critic/best.pt'))
+                        self.path, 'generator/best.pt'))
+                    torch.save(d_checkpoint, os.path.join(self.path, 'discriminator/best.pt')
+                               if self.discriminator else os.path.join(self.path, 'critic/best.pt'))
                 Ssim.append(ssim_source.item())
                 PSN.append(psn.item())
             self.log_message("Model SSIM : {}          PSN: {}".format(
@@ -272,7 +274,7 @@ class WGAN_GPTrainer(BaseTrainer):
         for i, (low_images, high_images) in pbar:
             low_images = low_images.to(self.device)
             high_images = high_images.to(self.device)
-            with autocast(device_type=self.args.device, enabled=self.args.amp):
+            with autocast(enabled=self.args.amp):
                 self.c_optimizer.zero_grad()
                 self.g_optimizer.zero_grad()
                 fake_images = self.generator(low_images)
