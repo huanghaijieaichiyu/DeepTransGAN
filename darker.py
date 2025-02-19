@@ -63,7 +63,7 @@ def darker(data_dir, ratio=0.5, phase="train"):
 if __name__ == '__main__':
     # 1. 设置数据集目录
     data_dir = "../datasets/kitti_LOL"  # 替换成你的数据集路径
-    ratio = 0.2  # 亮度降低的比例
+    ratio = 0.1  # 亮度降低的比例
 
     # 2. 生成低光照图像
     darker(data_dir, ratio=ratio, phase="train")

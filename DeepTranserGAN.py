@@ -70,8 +70,6 @@ class BaseTrainer:
             self.device) if args.loss else nn.MSELoss().to(self.device)
         self.stable_loss = nn.MSELoss().to(self.device)
         self.path = save_path(args.save_path)
-        self.log = tensorboard.writer.SummaryWriter(log_dir=self.args.save_path, filename_suffix=str(args.epochs),
-                                                    flush_secs=180)
 
         # 确保路径存在
         if self.args.resume == '':
@@ -86,6 +84,8 @@ class BaseTrainer:
         self.epoch = 0
         self.Ssim = [0.]
         self.PSN = [0.]
+        self.log = tensorboard.writer.SummaryWriter(log_dir=self.path, filename_suffix=str(args.epochs),
+                                                    flush_secs=180)
 
     def load_checkpoint(self):
         if self.args.resume != '':
@@ -111,10 +111,12 @@ class BaseTrainer:
             self.args.resume = ''
 
     def save_checkpoint(self):
-        g_checkpoint = {'net': self.generator.state_dict(
-        ), 'optimizer': self.g_optimizer.state_dict(), 'epoch': self.epoch}
+        g_checkpoint = {'net': self.generator.state_dict(),
+                        'optimizer': self.g_optimizer.state_dict(),
+                        'epoch': self.epoch}
         d_checkpoint = {'net': self.discriminator.state_dict() if self.discriminator else self.critic.state_dict() if self.critic else None,
-                        'optimizer': self.d_optimizer.state_dict(), 'epoch': self.epoch}
+                        'optimizer': self.d_optimizer.state_dict(),
+                        'epoch': self.epoch}
         torch.save(g_checkpoint, os.path.join(self.path, 'generator/last.pt'))
         torch.save(d_checkpoint, os.path.join(self.path, 'discriminator/last.pt')
                    if self.discriminator else os.path.join(self.path, 'critic/last.pt'))
@@ -225,7 +227,7 @@ class StandardGANTrainer(BaseTrainer):
                 d_x = real_inputs.mean().item()
                 d_fake_output = self.d_loss(fake_inputs, fake_lable)
                 d_g_z1 = fake_inputs.mean().item()
-                d_output = (d_real_output.item() + d_fake_output.item()) / 2.
+                d_output = d_real_output.item() + d_fake_output.item()
 
                 fake_inputs = self.discriminator(fake.detach())
                 g_output = self.g_loss(
@@ -236,7 +238,7 @@ class StandardGANTrainer(BaseTrainer):
                 g_output.backward()
                 d_g_z2 = fake_inputs.mean().item()
                 torch.nn.utils.clip_grad_norm_(
-                    self.discriminator.parameters(), 500)
+                    self.discriminator.parameters(), 1000)
                 torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)
                 self.d_optimizer.step()
                 self.g_optimizer.step()

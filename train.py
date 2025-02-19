@@ -39,7 +39,7 @@ def args():
                         help="weight of the generator")
     parser.add_argument("--model", type=str, default="train",
                         help="train or test model")
-    parser.add_argument("--b1", type=float, default=0.5,
+    parser.add_argument("--b1", type=float, default=0.9,
                         help="adam: decay of first order momentum of gradient")  # 动量梯度下降第一个参数
     parser.add_argument("--b2", type=float, default=0.999,
                         help="adam: decay of first order momentum of gradient")  # 动量梯度下降第二个参数
