@@ -142,3 +142,8 @@ models/__pycache__
 datasets/__pycache__
 utils/__pycache__
 datasets/__pycache__/data_set.cpython-310.pyc
+<<<<<<< HEAD
+=======
+/test_dark_countryard.mp4
+/examples/upc_dark.mp4
+>>>>>>> 0b2cd8f (更新依赖项，调整生成器参数，优化视频处理功能，修改README示例，更新命令行参数)
