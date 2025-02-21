@@ -129,6 +129,7 @@ dmypy.json
 *.jpg
 *.pt
 *.json
+*.mp4
 runs/
 goodmodel.pt.bak
 *.gif
@@ -141,5 +142,3 @@ models/__pycache__
 datasets/__pycache__
 utils/__pycache__
 datasets/__pycache__/data_set.cpython-310.pyc
-/test_dark_countryard.mp4
-/examples/upc_dark.mp4
