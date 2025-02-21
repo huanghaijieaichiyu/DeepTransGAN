@@ -19,6 +19,7 @@ code by 黄小海  2025/2/19
 import os
 import time
 import cv2
+import imageio
 import numpy as np
 import torch
 import torch.nn as nn
@@ -105,6 +106,7 @@ class BaseTrainer:
                 self.critic.load_state_dict(
                     d_checkpoint['net']) if self.critic else None
             self.d_optimizer.load_state_dict(d_checkpoint['optimizer'])
+
             print(f'继续第：{self.epoch + 1}轮训练')
             # 继续训练时，不需要再次设置路径
             self.path = self.args.resume
@@ -116,7 +118,8 @@ class BaseTrainer:
                         'epoch': self.epoch}
         d_checkpoint = {'net': self.discriminator.state_dict() if self.discriminator else self.critic.state_dict() if self.critic else None,
                         'optimizer': self.d_optimizer.state_dict(),
-                        'epoch': self.epoch}
+                        'epoch': self.epoch
+                        }
         torch.save(g_checkpoint, os.path.join(self.path, 'generator/last.pt'))
         torch.save(d_checkpoint, os.path.join(self.path, 'discriminator/last.pt')
                    if self.discriminator else os.path.join(self.path, 'critic/last.pt'))
@@ -141,13 +144,14 @@ class BaseTrainer:
         with open(self.train_log, "a") as f:
             f.write(to_write)
 
-    def visualize_results(self, epoch, gen_loss, dis_loss, high_images, fake):
+    def visualize_results(self, epoch, gen_loss, dis_loss, high_images, low_images, fake):
         self.log.add_scalar('generation loss', np.mean(gen_loss), epoch + 1)
         self.log.add_scalar('discrimination loss',
                             np.mean(dis_loss), epoch + 1)
         self.log.add_scalar('learning rate', self.g_optimizer.state_dict()[
                             'param_groups'][0]['lr'], epoch + 1)
         self.log.add_images('real', high_images, epoch + 1)
+        self.log.add_images('input', low_images, epoch + 1)
         self.log.add_images('fake', fake, epoch + 1)
 
     def evaluate_model(self):
@@ -256,7 +260,7 @@ class StandardGANTrainer(BaseTrainer):
         high_images = high_images.to(self.device)
         fake = fake.to(self.device)
         self.visualize_results(self.epoch, gen_loss,
-                               dis_loss, high_images, fake)
+                               dis_loss, high_images, low_images, fake)
 
 
 class WGAN_GPTrainer(BaseTrainer):
@@ -332,7 +336,7 @@ class WGAN_GPTrainer(BaseTrainer):
         high_images = high_images.to(self.device)
         fake_images = fake_images.to(self.device)
         self.visualize_results(self.epoch, gen_loss,
-                               critic_loss, high_images, fake_images)
+                               critic_loss, high_images, low_images, fake_images)
 
 
 def train(args):
@@ -367,7 +371,7 @@ class BasePredictor:
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
         self.save_path = args.save_path
-        self.generator = Generator()
+        self.generator = Generator(1, 1)
         model_structure(
             self.generator, (3, self.img_size[0], self.img_size[1]))
         checkpoint = torch.load(self.model)
@@ -433,61 +437,78 @@ class ImagePredictor(BasePredictor):
 class VideoPredictor(BasePredictor):
     def __init__(self, args):
         super().__init__(args)
+        self.video = args.video
         self.save_video = args.save_video
-        self.video_path = args.video_path
 
     def predict_images(self):
         raise NotImplementedError  # 该类不支持图片预测
 
     def predict_video(self):
-        if self.device == 'cuda':
-            device = torch.device(
-                'cuda' if torch.cuda.is_available() else 'cpu')
-        else:
-            device = torch.device('cpu')
-        cap = cv2.VideoCapture(self.video_path)  # 读取图像
-        if not cap.isOpened():
-            raise IOError("Cannot open video source")
+        print('running on the device: ', self.device)
 
-        fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+        try:
+            # 使用 imageio 打开视频
+            reader = imageio.get_reader(self.data)
+            fps = reader.get_meta_data()['fps']
+            width, height = reader.get_meta_data()['size']  # 宽度和高度
+        except Exception as e:
+            print(f"Error opening video with imageio: {e}")
+            return  # 退出函数
+
+        fourcc = 'h264'  # 或者 'H264'，取决于你的需求和系统支持
         if self.save_video:
-            write = cv2.VideoWriter(self.save_path + '/fake.mp4', fourcc, cap.get(cv2.CAP_PROP_FPS),
-                                    [640, 480])
-        else:
-            write = None
+            output_path = os.path.join(self.save_path, 'fake.mp4')
+            try:
+                writer = imageio.get_writer(output_path, fps=fps, codec=fourcc)
+            except Exception as e:
+                print(f"Error creating video writer with imageio: {e}")
+                return
 
-        torch.no_grad()
+        else:
+            writer = None
+
+        torch.no_grad().__enter__()  # 使用上下文管理器，确保 no_grad 状态正确管理
         if not os.path.exists(os.path.join(self.save_path, 'predictions')):
             os.makedirs(os.path.join(self.save_path, 'predictions'))
-        while cap.isOpened():
-            _, frame = cap.read()
-            if frame is None:
-                break
-            frame = cv2.resize(frame, (640, 480))
-            frame_pil = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_pil = torch.tensor(np.array(
-                frame_pil, np.float32) / 255., dtype=torch.float32).to(device)  # 转为tensor
-            frame_pil = torch.unsqueeze(frame_pil, 0).permute(
-                0, 3, 1, 2)  # 提升维度--转换维度
-            fake = self.generator(frame_pil)
-            fake = fake.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
-            cv2.imshow('fake', fake)
 
-            cv2.imshow('origin', frame)
+        try:
+            for i, frame in enumerate(reader):
+                # 视频帧处理开始
+                frame_resized = cv2.resize(frame, (640, 480))
+                frame_pil = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                frame_pil = torch.tensor(np.array(
+                    frame_pil, np.float32) / 255., dtype=torch.float32).to(self.device)  # 转为tensor
+                frame_pil = torch.unsqueeze(frame_pil, 0).permute(
+                    0, 3, 1, 2)  # 提升维度--转换维度
+                fake = self.generator(frame_pil)
+                fake = fake.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
+                # 视频帧处理结束
 
-            if self.save_video:
-                # 写入文件
-                # float转uint8 fake[0,1]转[0,255]
-                fake_uint8 = (fake * 255).astype(np.uint8)
-                write.write(fake_uint8)
+                # 显示帧 (仍然使用 OpenCV)
+                cv2.imshow('fake', fake)
+                cv2.imshow('origin', frame_resized)  # 显示resize后的原图
 
-            key = cv2.waitKey(1)
-            if key == 27:
-                cv2.destroyAllWindows()
-                break
-        cap.release()
-        if self.save_video:
-            write.release()
+                if self.save_video:
+                    # 写入文件
+                    fake_write = (np.clip(fake, 0, 1) *
+                                  255).astype(np.uint8)  # 确保数值在 0-255 之间
+                    writer.append_data(fake_write)
+
+                key = cv2.waitKey(1)
+                if key == 27:
+                    cv2.destroyAllWindows()
+                    break
+
+        except Exception as e:
+            print(f"Error processing video: {e}")
+
+        finally:
+            # 确保释放资源
+            reader.close()  # 关闭 reader
+            if self.save_video and writer is not None:
+                writer.close()  # 关闭 writer
+            cv2.destroyAllWindows()  # 关闭所有 OpenCV 窗口
+            torch.no_grad().__exit__(None, None, None)  # 退出 no_grad 上下文
 
 
 def predict(args):

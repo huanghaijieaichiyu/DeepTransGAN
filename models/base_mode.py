@@ -27,7 +27,7 @@ class BaseNetwork(nn.Module):
 
 
 class Generator(BaseNetwork):
-    def __init__(self, depth=0.8, weight=1):
+    def __init__(self, depth=1, weight=1):
         super().__init__()
         self.depth = depth
         self.weight = weight

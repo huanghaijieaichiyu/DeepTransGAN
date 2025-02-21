@@ -127,7 +127,6 @@ dmypy.json
 
 # other things
 *.jpg
-*.png
 *.pt
 *.json
 runs/
@@ -138,11 +137,9 @@ imagenet_pretrained/
 *.csv
 .idea
 models/__pycache__
-报告.markdown
-报告.docx
-报告.pdf
 
 datasets/__pycache__
 utils/__pycache__
 datasets/__pycache__/data_set.cpython-310.pyc
 /test_dark_countryard.mp4
+/examples/upc_dark.mp4
