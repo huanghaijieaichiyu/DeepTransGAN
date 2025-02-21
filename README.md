@@ -167,12 +167,3 @@ Fake Image:
 Generated image by the model.
 
 ### Examples Videos
-
-*   examples/dark_video.mp4: Dark video example.
-<iframe width="560" height="315" src="examples\dark_video.mp4" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
-
-*   examples/upc_dark.mp4: UPC dark video example.
-<iframe width="560" height="315" src="examples\upc_dark.mp4" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
-
-*   examples/upc_dark.mp4: generated video example.
-<iframe width="560" height="315" src="examples\fake.mp4" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
