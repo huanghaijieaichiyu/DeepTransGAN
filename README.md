@@ -175,4 +175,4 @@ Generated image by the model.
 ![暗处理](examples\dark_video.gif)
 
 *   examples/upc_dark.mp4: generated video example.
-![模型生成](examples\fake.gif)
+![模型生成](examples\fake.gif) 
