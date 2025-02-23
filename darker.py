@@ -118,5 +118,5 @@ if __name__ == '__main__':
     ''' # 2. 生成低光照图像
     darker(data_dir, ratio=ratio, phase="train")
     darker(data_dir, ratio=ratio, phase="test")'''
-    video_darker("upc_dark.mp4", ratio=ratio)
+    video_darker("examples/upc_dark.mp4", ratio=ratio)
     # 3. 生成低光照视频

@@ -121,6 +121,14 @@ python predict.py --data test_image.png --model runs/train(3)/generator/last.pt
 python predict.py --data 0 --model runs/train(3)/generator/last.pt
 ```
 
+## 或者使用我训练好的模型以及处理过的视频进行预测
+
+ 基于kitti数据集训练的模型下载链接：[https://cloud.189.cn/web/share?code=2yuIVbFreMjq](https://cloud.189.cn/web/share?code=2yuIVbFreMjq（访问码：rbr4）)
+ 处理前视频：[https://cloud.189.cn/web/share?code=YJVnyqqYJBru](https://cloud.189.cn/web/share?code=YJVnyqqYJBru（访问码：8lkp）)
+ 处理后视频：[https://cloud.189.cn/web/share?code=J3q2uyiMRJvi（访问码：lmw6）](https://cloud.189.cn/web/share?code=J3q2uyiMRJvi（访问码：lmw6）)
+
+ ###  你可以使用我处理的视频，或者自己通过darker.py处理自己想要处理的数据集及视频
+
 ### 数据集
 
 该项目使用 LOLdataset，其中包含低光照和正常光照图像对。`datasets/data_set.py` 中的 `LowLightDataset` 类处理加载和预处理数据。
@@ -154,6 +162,8 @@ LOLdataset/
 [检查 `LICENSE` 文件]
 
 ## Examples
+
+
 
 Real Image:
 
