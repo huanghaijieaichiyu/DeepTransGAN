@@ -159,30 +159,4 @@ LOLdataset/
 
 ## 许可证
 
-[检查 `LICENSE` 文件]
-
-## Examples
-
-
-
-Real Image:
-
-![Real Image](examples/real.png)
-Real image from the dataset.
-
-Fake Image:
-
-![Fake Image](
-![Real Image](examples/fake.png)
-Generated image by the model.
-
-### Examples Videos
-
-*   examples/dark_video.mp4: Dark video example.
-<<<<<<< HEAD
-![原始视频](examples\upc_dark.gif)
-*   examples/upc_dark.mp4: UPC dark video example.
-![暗处理](examples\dark_video.gif)
-
-*   examples/upc_dark.mp4: generated video example.
-![模型生成](examples\fake.gif)
+This project is now licensed under the Apache 2.0 License. See the `LICENCE` file for details.
