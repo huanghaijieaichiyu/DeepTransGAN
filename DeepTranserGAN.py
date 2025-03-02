@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
+from torch.optim.lr_scheduler import StepLR
 from torch.utils import tensorboard
 from torch.utils.data import DataLoader
 from torcheval.metrics.functional import peak_signal_noise_ratio
@@ -53,9 +54,10 @@ class BaseTrainer:
             self.critic = self.critic.to(self.device)
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(10),
             transforms.Resize((args.img_size[0], args.img_size[1])),
             transforms.ToTensor(),
-            # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
         self.train_data = LowLightDataset(
             image_dir=args.data, transform=self.transform, phase="train")
@@ -71,6 +73,14 @@ class BaseTrainer:
             self.device) if args.loss else nn.MSELoss().to(self.device)
         self.stable_loss = nn.MSELoss().to(self.device)
         self.path = save_path(args.save_path)
+        # 新增参数--保存最佳模型
+        self.best_psnr = 0.0
+        self.patience = args.patience  # 新增参数，示例值 10
+        self.patience_counter = 1
+
+        # 学习率调整
+        self.scheduler_g = StepLR(self.g_optimizer, step_size=10, gamma=0.1)
+        self.scheduler_d = StepLR(self.d_optimizer, step_size=10, gamma=0.1)
 
         # 确保路径存在
         if self.args.resume == '':
@@ -92,23 +102,32 @@ class BaseTrainer:
         if self.args.resume != '':
             g_path_checkpoint = os.path.join(
                 self.args.resume, 'generator/last.pt')
-            g_checkpoint = torch.load(g_path_checkpoint)
-            self.generator.load_state_dict(g_checkpoint['net'])
-            self.g_optimizer.load_state_dict(g_checkpoint['optimizer'])
-            self.epoch = g_checkpoint['epoch']
+            if os.path.exists(g_path_checkpoint):
+                g_checkpoint = torch.load(
+                    g_path_checkpoint, map_location=self.device)
+                self.generator.load_state_dict(g_checkpoint['net'])
+                self.g_optimizer.load_state_dict(g_checkpoint['optimizer'])
+                self.epoch = g_checkpoint['epoch']
+            else:
+                raise FileNotFoundError(
+                    f"Generator checkpoint {g_path_checkpoint} not found.")
 
             d_path_checkpoint = os.path.join(
                 self.args.resume, 'discriminator/last.pt') if self.discriminator else os.path.join(self.args.resume, 'critic/last.pt')
-            d_checkpoint = torch.load(d_path_checkpoint)
-            if self.discriminator:
-                self.discriminator.load_state_dict(d_checkpoint['net'])
+            if os.path.exists(d_path_checkpoint):
+                d_checkpoint = torch.load(
+                    d_path_checkpoint, map_location=self.device)
+                if self.discriminator:
+                    self.discriminator.load_state_dict(d_checkpoint['net'])
+                else:
+                    self.critic.load_state_dict(
+                        d_checkpoint['net']) if self.critic else None
+                self.d_optimizer.load_state_dict(d_checkpoint['optimizer'])
             else:
-                self.critic.load_state_dict(
-                    d_checkpoint['net']) if self.critic else None
-            self.d_optimizer.load_state_dict(d_checkpoint['optimizer'])
+                raise FileNotFoundError(
+                    f"Discriminator/Critic checkpoint {d_path_checkpoint} not found.")
 
-            print(f'继续第：{self.epoch + 1}轮训练')
-            # 继续训练时，不需要再次设置路径
+            print(f'Continuing training from epoch: {self.epoch + 1}')
             self.path = self.args.resume
             self.args.resume = ''
 
@@ -184,6 +203,19 @@ class BaseTrainer:
             self.log_message("Model SSIM : {}          PSN: {}".format(
                 np.mean(Ssim), np.mean(PSN)))
 
+            # ... 评估逻辑 ...
+            current_psnr = np.mean(PSN)
+            if current_psnr > self.best_psnr:
+                self.best_psnr = current_psnr
+                self.patience_counter = 0
+                # 保存最佳模型
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= self.patience:
+                    print("Early stopping triggered.")
+                    return True  # 表示停止训练
+            return False
+
     def train_epoch(self):
         raise NotImplementedError
 
@@ -217,6 +249,7 @@ class StandardGANTrainer(BaseTrainer):
             low_images = low_images.to(self.device)
             high_images = high_images.to(self.device)
             with autocast(enabled=self.args.amp):
+
                 self.d_optimizer.zero_grad()
                 self.g_optimizer.zero_grad()
                 fake = self.generator(low_images)
@@ -241,9 +274,9 @@ class StandardGANTrainer(BaseTrainer):
                 d_fake_output.backward()
                 g_output.backward()
                 d_g_z2 = fake_inputs.mean().item()
-                torch.nn.utils.clip_grad_norm_(
+                '''torch.nn.utils.clip_grad_norm_(
                     self.discriminator.parameters(), 1000)
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)'''
                 self.d_optimizer.step()
                 self.g_optimizer.step()
 
@@ -256,6 +289,9 @@ class StandardGANTrainer(BaseTrainer):
                                      % (self.epoch + 1, self.args.epochs, i + 1, len(self.train_loader),
                                         d_output, g_output.item(), d_x, d_g_z1, d_g_z2))
                 self.save_checkpoint()
+                # 学习率调整
+                self.scheduler_g.step()
+                self.scheduler_d.step()
         self.write_log(self.epoch, gen_loss, dis_loss, d_x, d_g_z1, d_g_z2)
         high_images = high_images.to(self.device)
         fake = fake.to(self.device)

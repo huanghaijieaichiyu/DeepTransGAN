@@ -65,7 +65,8 @@ def args():
                         help="Gradient penalty coefficient (WGAN-GP)")
     parser.add_argument("--clip_value", type=float, default=0.01,
                         help="Weight clipping value (WGAN without GP)")
-
+    parser.add_argument("--patience", type=int, default=20,
+                        help="Number of epochs to wait before early stopping")
     #  此处开始训练
     arges = parser.parse_args()
     return arges

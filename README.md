@@ -7,23 +7,10 @@
 
 本项目实现了一种深度学习方法，用于对灰度图像进行着色。它使用了一种改进的DCGAN（深度卷积生成对抗网络）架构，具有自注意力机制、跨层连接和残差块。该模型在转换为LAB颜色空间的RGB图像上进行训练，使用A和B通道作为颜色信息标签。
 
-## 概述
-
-该项目包括以下关键组件：
-
-*   **`engine.py`**: 包含核心训练和预测逻辑。
-*   **`train.py`**: 实现了带有参数解析的训练脚本。
-*   **`predict.py`**: 实现了图像着色和实时视频着色的预测脚本。
-*   **`models/`**: 包含模型定义：
-    *   `base_mode.py`: 定义了生成器（Generator）、判别器（Discriminator）和评论家（Critic）模型。
-    *   `Repvit.py`: 定义了RepViTBlock。
-    *   `common.py`: 定义了通用层和块。
-*   **`datasets/`**: 包含数据集加载和预处理逻辑：
-    *   `data_set.py`: 实现了用于加载LOLdataset的`LowLightDataset`类。
-*   **`utils/`**: 包含实用函数：
-    *   `color_trans.py`: 包含颜色空间转换函数（RGB到LAB和LAB到RGB）。
-    *   `loss.py`: 定义了自定义损失函数。
-    *   `misic.py`: 包含训练的辅助函数。
+## 效果
+LOL数据集预测结果：
+![Real](examples/real.png)
+![fake](examples/fake.png)
 
 ## 安装
 
@@ -156,7 +143,3 @@ LOLdataset/
 ## 使用 WGAN 进行训练
 
 `engine.py` 文件还包括一个 `train_WGAN` 函数，用于使用 WGAN-GP（具有梯度惩罚的 Wasserstein GAN）方法训练模型。这可能会导致更稳定的训练和更好的结果。要使用它，您需要修改 `train.py` 脚本以调用 `train_WGAN` 而不是 `train`。
-
-## 许可证
-
-This project is now licensed under the Apache 2.0 License. See the `LICENCE` file for details.
