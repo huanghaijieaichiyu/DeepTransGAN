@@ -32,7 +32,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import Generator, Discriminator, Critic
+from models.base_mode import CNNTransformerGenerator, Generator, Discriminator, Critic
 from utils.loss import BCEBlurWithLogitsLoss
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
 
@@ -70,7 +70,10 @@ class BaseTrainer:
         self.g_loss = get_loss(args.loss).to(
             self.device) if args.loss else nn.MSELoss().to(self.device)
         self.stable_loss = nn.MSELoss().to(self.device)
-
+        self.path = save_path(
+            args.save_path) if args.resume == '' else args.resume
+        self.log = tensorboard.writer.SummaryWriter(log_dir=self.path, filename_suffix=str(args.epochs),
+                                                    flush_secs=180)
         # 新增参数--保存最佳模型
         self.best_psnr = 0.0
         self.patience = args.patience  # 新增参数，示例值 10
@@ -93,9 +96,6 @@ class BaseTrainer:
         self.epoch = 0
         self.Ssim = [0.]
         self.PSN = [0.]
-        self.log = tensorboard.writer.SummaryWriter(log_dir=self.path, filename_suffix=str(args.epochs),
-                                                    flush_secs=180)
-        self.path = save_path(args.save_path)
 
     def load_checkpoint(self):
         if self.args.resume != '':
@@ -374,7 +374,7 @@ class WGAN_GPTrainer(BaseTrainer):
 
 
 def train(args):
-    generator = Generator(args.depth, args.weight)
+    generator = CNNTransformerGenerator(args.depth, args.weight)
     discriminator = Discriminator(
         batch_size=args.batch_size, img_size=args.img_size[0])
     model_structure(generator, (3, args.img_size[0], args.img_size[1]))
