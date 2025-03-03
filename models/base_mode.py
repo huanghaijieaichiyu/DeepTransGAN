@@ -390,6 +390,20 @@ class DualPrunedSelfAttn(nn.Module):
 
 
 class HybridPerceptionBlock(nn.Module):
+    '''
+    Hybrid Perception Block，包含一个双向剪枝自注意力模块和一个卷积模块
+    参数：
+        dim: 输入特征维度
+        dim_head: 注意力头维度
+        heads: 注意力头数
+        attn_height_top_k: 自注意力模块行剪枝 topk
+        attn_width_top_k: 自注意力模块列剪枝 topk
+        attn_dropout: 注意力模块 dropout
+        ff_mult: FFN 中间层维度倍数
+        ff_dropout: FFN dropout
+
+    '''
+
     def __init__(self, dim, dim_head, heads, attn_height_top_k, attn_width_top_k, attn_dropout, ff_mult, ff_dropout):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
@@ -430,6 +444,11 @@ class HybridPerceptionBlock(nn.Module):
 
 
 class SWTformerGenerator(nn.Module):
+    '''
+    SWTformer 生成器：Swing Transformer + CNN
+
+    '''
+
     def __init__(self, depth=1, weight=1):
         super().__init__()
         self.depth = depth
@@ -479,12 +498,17 @@ class SWTformerGenerator(nn.Module):
         )
 
     def forward(self, x):
+        # 编码器 (CNN)
         x1 = self.conv1(x)
         x2 = self.conv2(x1)
         x3 = self.conv3(x2)
         x4 = self.conv4(x3)
+
+        # Swing Transformer + 混合感知块（HPB） 处理
         x5 = self.hpb1(x4)
         x5 = self.hpb2(x5)
+
+        # 解码器 (CNN + 上采样)
         x6 = self.conv6(x5)
         x7 = self.conv7(self.concat([x6, x3]))
         x8 = self.conv8(self.concat([x7, x2]))
