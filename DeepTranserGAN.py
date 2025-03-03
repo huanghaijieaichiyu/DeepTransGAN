@@ -54,10 +54,8 @@ class BaseTrainer:
             self.critic = self.critic.to(self.device)
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10),
             transforms.Resize((args.img_size[0], args.img_size[1])),
-            transforms.ToTensor(),
+            transforms.ToTensor()
         ])
         self.train_data = LowLightDataset(
             image_dir=args.data, transform=self.transform, phase="train")
@@ -72,7 +70,7 @@ class BaseTrainer:
         self.g_loss = get_loss(args.loss).to(
             self.device) if args.loss else nn.MSELoss().to(self.device)
         self.stable_loss = nn.MSELoss().to(self.device)
-        self.path = save_path(args.save_path)
+
         # 新增参数--保存最佳模型
         self.best_psnr = 0.0
         self.patience = args.patience  # 新增参数，示例值 10
@@ -97,6 +95,7 @@ class BaseTrainer:
         self.PSN = [0.]
         self.log = tensorboard.writer.SummaryWriter(log_dir=self.path, filename_suffix=str(args.epochs),
                                                     flush_secs=180)
+        self.path = save_path(args.save_path)
 
     def load_checkpoint(self):
         if self.args.resume != '':
@@ -267,8 +266,7 @@ class StandardGANTrainer(BaseTrainer):
                 d_output = d_real_output.item() + d_fake_output.item()
 
                 fake_inputs = self.discriminator(fake.detach())
-                g_output = self.g_loss(
-                    fake_inputs, real_lable) + self.stable_loss(fake, high_images)
+                g_output = self.g_loss(fake_inputs, real_lable)
 
                 d_real_output.backward()
                 d_fake_output.backward()

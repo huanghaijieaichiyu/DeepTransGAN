@@ -90,7 +90,7 @@ class Darker:
 if __name__ == '__main__':
     # 处理图像示例
     data_dir = "../datasets/kitti_LOL"  # 替换成你的数据集路径
-    ratio = 0.05  # 亮度降低的比例
+    ratio = 0.1  # 亮度降低的比例
 
     # 处理 train 和 test 两个阶段的图像数据集
     darker_train = Darker(data_dir, ratio=ratio, phase="train")

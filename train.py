@@ -29,7 +29,7 @@ def args():
     parser.add_argument("--loss", type=str, default='BCEBlurWithLogitsLoss',
                         choices=['BCEBlurWithLogitsLoss', 'mse', 'bce',
                                  'FocalLoss'], help="loss function")
-    parser.add_argument("--lr", type=float, default=0.5e-4,
+    parser.add_argument("--lr", type=float, default=1e-3,
                         help="learning rate, for adam is 1-e3, SGD is 1-e2")  # 学习率
     parser.add_argument("--momentum", type=float, default=0.5,
                         help="momentum for adam and SGD")

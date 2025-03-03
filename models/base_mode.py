@@ -164,8 +164,7 @@ class Critic(BaseNetwork):
             Disconv(out_channels, out_channels * 2),  # Increased out_channels
             RepViTBlock(out_channels * 2, in_channels, weight, 2),
             Disconv(in_channels, in_channels // 2),  # Reduced out_channels
-            RepViTBlock(in_channels // 2, in_channels // 4, weight, 2),
-            Disconv(in_channels // 4, in_channels // 8)
+            RepViTBlock(in_channels // 2, in_channels // 4, weight, 2)
         )
 
     def forward(self, x):
