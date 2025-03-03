@@ -245,7 +245,7 @@ class Critic(BaseNetwork):
         x = self.liner(x)     # (B, 1)
         return x
 
-# GAN���成器
+# GAN成器
 
 
 class CNNTransformerGenerator(nn.Module):
@@ -328,4 +328,165 @@ class CNNTransformerGenerator(nn.Module):
         x8 = self.conv8(self.concat([x7, x2]))  # (B, 112*d, H, W)
         x9 = self.tanh(self.conv9(x8))  # (B, 3, H, W)
 
+        return x9
+
+
+class DualPrunedSelfAttn(nn.Module):
+    '''
+    双向剪枝自注意力模块
+    '''
+
+    def __init__(self, dim, dim_head, heads, height_top_k, width_top_k, dropout=0.):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.to_out = nn.Linear(dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.height_top_k = height_top_k
+        self.width_top_k = width_top_k
+
+    def forward(self, x):
+        B, N, C = x.size()
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: t.view(B, N, self.heads,
+                      self.dim_head).transpose(1, 2), qkv)
+        attn = torch.einsum('b h i d, b h j d -> b h i j',
+                            q, k) * (self.dim_head ** -0.5)
+        attn = self.prune_attn(attn, self.height_top_k, self.width_top_k)
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = self.to_out(out)
+        return out
+
+    def prune_attn(self, attn, height_top_k, width_top_k):
+        B, H, N, _ = attn.shape
+        device = attn.device
+
+        # --- 行剪枝：对每个头和每个查询，选择 topk 行（对应 keys 的维度，为最后一维）
+        # 计算每个查询对所有 key 的平均分数，形状为 [B, H, N]
+        row_scores = attn.mean(dim=-1)
+        _, top_row_idx = row_scores.topk(
+            height_top_k, dim=-1)  # [B, H, height_top_k]
+        # 构造行掩码：[B, H, N]
+        row_mask = torch.zeros(B, H, N, device=device)
+        row_mask.scatter_(-1, top_row_idx, 1)
+        # 扩展到 [B, H, N, N]，作用于最后一维
+        row_mask = row_mask.unsqueeze(-1).expand(B, H, N, N)
+
+        # --- 列剪枝：对每个头和每个 key，选择 topk 列（对应 query 的维度，为倒数第二维）
+        col_scores = attn.mean(dim=-2)  # [B, H, N]
+        _, top_col_idx = col_scores.topk(
+            width_top_k, dim=-1)  # [B, H, width_top_k]
+        col_mask = torch.zeros(B, H, N, device=device)
+        col_mask.scatter_(-1, top_col_idx, 1)
+        # 扩展到 [B, H, N, N]，作用于倒数第二维
+        col_mask = col_mask.unsqueeze(-2).expand(B, H, N, N)
+
+        mask = row_mask * col_mask
+        return attn * mask
+
+
+class HybridPerceptionBlock(nn.Module):
+    def __init__(self, dim, dim_head, heads, attn_height_top_k, attn_width_top_k, attn_dropout, ff_mult, ff_dropout):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.attn = DualPrunedSelfAttn(
+            dim, dim_head, heads, attn_height_top_k, attn_width_top_k, dropout=attn_dropout)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.ff = nn.ModuleList([
+            nn.Linear(dim, dim * ff_mult),
+            nn.SiLU(),
+            nn.Dropout(ff_dropout),
+            nn.Linear(dim * ff_mult, dim),
+        ])
+        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+        # Attention 分支
+        x_attn = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
+        x_attn = self.norm1(x_attn)
+        x_attn = self.attn(x_attn)
+        x_attn = x_attn.view(B, H, W, C).permute(0, 3, 1, 2)
+        # 卷积分支
+        x_conv = self.conv(x)
+        x = x_attn + x_conv
+
+        # FFN 分支
+        # 先将特征转到 (B*H*W, C) 的形状
+        normed = self.norm2(x.permute(0, 2, 3, 1))
+        normed = normed.contiguous().view(B * H * W, C)
+        ff_out = self.ff[0](normed)
+        ff_out = self.ff[1](ff_out)
+        ff_out = self.ff[2](ff_out)
+        ff_out = self.ff[3](ff_out)
+        # 恢复成 CNN 格式，并残差相加
+        ff_out = ff_out.view(B, H, W, C).permute(0, 3, 1, 2)
+        x = x + ff_out
+        return x
+
+
+class SWTformerGenerator(nn.Module):
+    def __init__(self, depth=1, weight=1):
+        super().__init__()
+        self.depth = depth
+        self.weight = weight
+        self.conv1 = nn.Conv2d(
+            3, int(math.ceil(8 * self.depth)), kernel_size=3, stride=1, padding=1)
+        self.conv2 = self._make_cnn_block(
+            int(math.ceil(8 * self.depth)), int(math.ceil(16 * self.depth)))
+        self.conv3 = self._make_cnn_block(
+            int(math.ceil(16 * self.depth)), int(math.ceil(32 * self.depth)))
+        self.conv4 = self._make_cnn_block(
+            int(math.ceil(32 * self.depth)), int(math.ceil(64 * self.depth)))
+        dim = int(math.ceil(64 * self.depth))
+        dim_head = dim // 8
+        self.hpb1 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=16,
+                                          attn_width_top_k=16, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
+        self.hpb2 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=16,
+                                          attn_width_top_k=16, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
+        self.conv6 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+        self.conv7 = nn.Sequential(
+            nn.Conv2d(dim + int(math.ceil(32 * self.depth)), dim +
+                      int(math.ceil(32 * self.depth)), kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+        self.conv8 = nn.Sequential(
+            nn.Conv2d(dim + int(math.ceil(16 * self.depth)) + int(math.ceil(32 * self.depth)), dim + int(
+                math.ceil(16 * self.depth)) + int(math.ceil(32 * self.depth)), kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+        self.conv9 = nn.Conv2d(dim + int(math.ceil(16 * self.depth)) +
+                               int(math.ceil(32 * self.depth)), 3, kernel_size=3, padding=1)
+        self.tanh = nn.Sigmoid()
+        self.concat = lambda x: torch.cat(x, dim=1)
+
+    def _make_cnn_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels,
+                      kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU()
+        )
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = self.conv4(x3)
+        x5 = self.hpb1(x4)
+        x5 = self.hpb2(x5)
+        x6 = self.conv6(x5)
+        x7 = self.conv7(self.concat([x6, x3]))
+        x8 = self.conv8(self.concat([x7, x2]))
+        x9 = self.tanh(self.conv9(x8))
         return x9

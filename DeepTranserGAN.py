@@ -32,7 +32,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import CNNTransformerGenerator, Generator, Discriminator, Critic
+from models.base_mode import CNNTransformerGenerator, Generator, Discriminator, Critic, SWTformerGenerator
 from utils.loss import BCEBlurWithLogitsLoss
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
 
@@ -266,7 +266,8 @@ class StandardGANTrainer(BaseTrainer):
                 d_output = d_real_output.item() + d_fake_output.item()
 
                 fake_inputs = self.discriminator(fake.detach())
-                g_output = self.g_loss(fake_inputs, real_lable)
+                g_output = self.g_loss(fake_inputs, real_lable) + self.stable_loss(
+                    fake, high_images)  # 增加像素损失，提高生成图像质量
 
                 d_real_output.backward()
                 d_fake_output.backward()
@@ -374,7 +375,7 @@ class WGAN_GPTrainer(BaseTrainer):
 
 
 def train(args):
-    generator = CNNTransformerGenerator(args.depth, args.weight)
+    generator = SWTformerGenerator(args.depth, args.weight)
     discriminator = Discriminator(
         batch_size=args.batch_size, img_size=args.img_size[0])
     model_structure(generator, (3, args.img_size[0], args.img_size[1]))
