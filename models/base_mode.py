@@ -104,64 +104,30 @@ class Discriminator(BaseNetwork):
     def __init__(self, batch_size=8, img_size=256):
         super().__init__()
         self.batch_size = batch_size
-        self.ratio = img_size / 256.  # 图像尺寸缩放比例
+        self.ratio = img_size / 256.  # Store ratio as an instance variable
 
-        # CNN 编码器部分
-        self.conv_in = nn.Sequential(
-            nn.Conv2d(3, 8, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),  # 下采样
-            nn.ReLU(inplace=True)
-        )
+        # Define layers
+        self.conv_in = nn.Sequential(Disconv(3, 8), RepViTBlock(8, 16, 3, 2))
+        self.conv1 = self._make_sequential(16, 32, 3)
+        self.conv_out = Disconv(4, 1, bn=False, act=False)
+        self.act = nn.Identity()  # BCEWithLogitLOSS 在输入前已经sigmoid，无需再限制输出
 
-        self.conv1 = self._make_cnn_block(16, 32)
-
-        # Transformer 部分
-        transformer_layers = nn.TransformerEncoderLayer(
-            d_model=32,  # 输入通道数
-            nhead=4,     # 注意力头数
-            dim_feedforward=64,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            transformer_layers, num_layers=2)
-
-        # 输出层
-        self.conv_out = nn.Sequential(
-            nn.Conv2d(32, 4, kernel_size=3, stride=2, padding=1),  # 下采样并减少通道
-            nn.ReLU(inplace=True),
-            nn.Conv2d(4, 1, kernel_size=3, stride=1, padding=1),   # 输出单一通道
-        )
-        self.act = nn.Sigmoid()
-
-    def _make_cnn_block(self, in_channels, out_channels):
-        """创建 CNN 块：卷积 + BN + ReLU + 下采样"""
+    def _make_sequential(self, in_channels, out_channels, weight):
+        """
+        Creates a sequential block for the discriminator.
+        """
         return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels,
-                      kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            RepViTBlock(in_channels, out_channels, weight, 2),
+            Disconv(out_channels, out_channels * 2),  # Increased out_channels
+            RepViTBlock(out_channels * 2, in_channels, weight, 2),
+            Disconv(in_channels, in_channels // 2),  # Reduced out_channels
+            RepViTBlock(in_channels // 2, in_channels // 4, weight, 2),
+            Disconv(in_channels // 4, 4)
         )
 
     def forward(self, x):
-        # CNN 特征提取
-        x = self.conv_in(x)  # (B, 16, H/2, W/2)
-        x = self.conv1(x)    # (B, 32, H/4, W/4)
-
-        # Transformer 处理
-        B, C, H, W = x.shape
-        x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # (B, H*W, 32)
-        x = self.transformer(x_flat)                    # (B, H*W, 32)
-        x = x.permute(0, 2, 1).view(B, C, H, W)        # (B, 32, H/4, W/4)
-
-        # 输出判别结果
-        x = self.conv_out(x)  # (B, 1, H/8, W/8)
-        x = self.act(x).view(
+        x = self.act(self.conv_out(self.conv1(self.conv_in(x)))).view(
             self.batch_size if x.shape[0] == self.batch_size else x.shape[0], -1)
-
-        # 平均池化到单一值
-        x = x.mean(dim=1, keepdim=True)  # (B, 1)
         return x
 
 
@@ -173,77 +139,46 @@ class Critic(BaseNetwork):
     def __init__(self, batch_size=8, img_size=256):
         super().__init__()
         self.batch_size = batch_size
-        self.ratio = img_size / 256.  # 图像尺寸缩放比例
+        self.ratio = img_size / 256.  # Store ratio as an instance variable
 
-        # CNN 编码器部分
+        # 定义层
         self.conv_in = nn.Sequential(
-            nn.Conv2d(3, 8, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1),  # 下采样
-            nn.LeakyReLU(0.2, inplace=True)
+            Disconv(3, 8, bn=False, act=True),  # WGAN 通常避免输入层的 BN
+            RepViTBlock(8, 16, 3, 2)
         )
+        self.conv1 = self._make_sequential(16, 32, 3)
+        self.conv_out = Disconv(4, 1, bn=False, act=False)  # 输出实数值，无激活
 
-        self.conv1 = self._make_cnn_block(16, 32)
+        # 初始化权重
+        self.apply(self.init_weights)
 
-        # Transformer 部分
-        transformer_layers = nn.TransformerEncoderLayer(
-            d_model=32,  # 输入通道数
-            nhead=4,     # 注意力头数
-            dim_feedforward=64,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            transformer_layers, num_layers=2)
-
-        # 输出卷积层
-        self.conv_out = nn.Conv2d(
-            32, 4, kernel_size=3, stride=2, padding=1)  # 下采样并减少通道
-
-        # 线性层，逐步压缩到单一值
-        self.flat = nn.Flatten()
-        self.liner = nn.Sequential(
-            nn.Linear(math.ceil(4 * (img_size / 8) *
-                      (img_size / 8)), 16 * 16),  # 根据下采样计算
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(16 * 16, 8 * 16),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(8 * 16, 8 * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(8 * 8, 4 * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(4 * 8, 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(8, 1)  # 输出单一值，无激活
-        )
-
-    def _make_cnn_block(self, in_channels, out_channels):
-        """创建 CNN 块：卷积 + BN + LeakyReLU + 下采样"""
+    def _make_sequential(self, in_channels, out_channels, weight):
+        """
+        Creates a sequential block for the discriminator.
+        """
         return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels,
-                      kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(0.2, inplace=True)
+            RepViTBlock(in_channels, out_channels, weight, 2),
+            Disconv(out_channels, out_channels * 2),
+            RepViTBlock(out_channels * 2, in_channels, weight, 2),
+            Disconv(in_channels, in_channels // 2),
+            RepViTBlock(in_channels // 2, in_channels // 4, weight, 2),
+            Disconv(in_channels // 4, 4)
         )
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        # CNN 特征提取
-        x = self.conv_in(x)  # (B, 16, H/2, W/2)
-        x = self.conv1(x)    # (B, 32, H/4, W/4)
-
-        # Transformer 处理
-        B, C, H, W = x.shape
-        x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # (B, H*W, 32)
-        x = self.transformer(x_flat)                    # (B, H*W, 32)
-        x = x.permute(0, 2, 1).view(B, C, H, W)        # (B, 32, H/4, W/4)
-
-        # 输出特征图并展平
-        x = self.conv_out(x)  # (B, 4, H/8, W/8)
-        x = self.flat(x)      # (B, 4 * H/8 * W/8)
-
-        # 线性层生成单一值
-        x = self.liner(x)     # (B, 1)
-        return x
+        x = self.conv_in(x)
+        x = self.conv1(x)
+        x = self.conv_out(x)
+        # 调整输出形状
+        batch_size = x.shape[0] if x.shape[0] != self.batch_size else self.batch_size
+        x = x.view(batch_size, -1)
+        return x.mean(dim=1, keepdim=True)  # 输出实数值
 
 # GAN成器
 
@@ -332,10 +267,6 @@ class CNNTransformerGenerator(nn.Module):
 
 
 class DualPrunedSelfAttn(nn.Module):
-    '''
-    双向剪枝自注意力模块
-    '''
-
     def __init__(self, dim, dim_head, heads, height_top_k, width_top_k, dropout=0.):
         super().__init__()
         self.heads = heads
@@ -364,46 +295,23 @@ class DualPrunedSelfAttn(nn.Module):
     def prune_attn(self, attn, height_top_k, width_top_k):
         B, H, N, _ = attn.shape
         device = attn.device
-
-        # --- 行剪枝：对每个头和每个查询，选择 topk 行（对应 keys 的维度，为最后一维）
-        # 计算每个查询对所有 key 的平均分数，形状为 [B, H, N]
         row_scores = attn.mean(dim=-1)
-        _, top_row_idx = row_scores.topk(
-            height_top_k, dim=-1)  # [B, H, height_top_k]
-        # 构造行掩码：[B, H, N]
+        _, top_row_idx = row_scores.topk(height_top_k, dim=-1)
         row_mask = torch.zeros(B, H, N, device=device)
         row_mask.scatter_(-1, top_row_idx, 1)
-        # 扩展到 [B, H, N, N]，作用于最后一维
         row_mask = row_mask.unsqueeze(-1).expand(B, H, N, N)
-
-        # --- 列剪枝：对每个头和每个 key，选择 topk 列（对应 query 的维度，为倒数第二维）
-        col_scores = attn.mean(dim=-2)  # [B, H, N]
-        _, top_col_idx = col_scores.topk(
-            width_top_k, dim=-1)  # [B, H, width_top_k]
+        col_scores = attn.mean(dim=-2)
+        _, top_col_idx = col_scores.topk(width_top_k, dim=-1)
         col_mask = torch.zeros(B, H, N, device=device)
         col_mask.scatter_(-1, top_col_idx, 1)
-        # 扩展到 [B, H, N, N]，作用于倒数第二维
         col_mask = col_mask.unsqueeze(-2).expand(B, H, N, N)
-
         mask = row_mask * col_mask
         return attn * mask
 
+# Hybrid Perception Block
+
 
 class HybridPerceptionBlock(nn.Module):
-    '''
-    Hybrid Perception Block，包含一个双向剪枝自注意力模块和一个卷积模块
-    参数：
-        dim: 输入特征维度
-        dim_head: 注意力头维度
-        heads: 注意力头数
-        attn_height_top_k: 自注意力模块行剪枝 topk
-        attn_width_top_k: 自注意力模块列剪枝 topk
-        attn_dropout: 注意力模块 dropout
-        ff_mult: FFN 中间层维度倍数
-        ff_dropout: FFN dropout
-
-    '''
-
     def __init__(self, dim, dim_head, heads, attn_height_top_k, attn_width_top_k, attn_dropout, ff_mult, ff_dropout):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
@@ -412,7 +320,7 @@ class HybridPerceptionBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         self.ff = nn.ModuleList([
             nn.Linear(dim, dim * ff_mult),
-            nn.SiLU(),
+            nn.GELU(),  # 使用 GELU 避免梯度消失
             nn.Dropout(ff_dropout),
             nn.Linear(dim * ff_mult, dim),
         ])
@@ -420,39 +328,32 @@ class HybridPerceptionBlock(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.size()
-        # Attention 分支
         x_attn = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
         x_attn = self.norm1(x_attn)
         x_attn = self.attn(x_attn)
         x_attn = x_attn.view(B, H, W, C).permute(0, 3, 1, 2)
-        # 卷积分支
         x_conv = self.conv(x)
         x = x_attn + x_conv
-
-        # FFN 分支
-        # 先将特征转到 (B*H*W, C) 的形状
         normed = self.norm2(x.permute(0, 2, 3, 1))
         normed = normed.contiguous().view(B * H * W, C)
         ff_out = self.ff[0](normed)
         ff_out = self.ff[1](ff_out)
         ff_out = self.ff[2](ff_out)
         ff_out = self.ff[3](ff_out)
-        # 恢复成 CNN 格式，并残差相加
         ff_out = ff_out.view(B, H, W, C).permute(0, 3, 1, 2)
         x = x + ff_out
         return x
 
+# 更新后的生成器
+
 
 class SWTformerGenerator(nn.Module):
-    '''
-    SWTformer 生成器：Swing Transformer + CNN
-
-    '''
-
     def __init__(self, depth=1, weight=1):
         super().__init__()
         self.depth = depth
         self.weight = weight
+
+        # 编码器
         self.conv1 = nn.Conv2d(
             3, int(math.ceil(8 * self.depth)), kernel_size=3, stride=1, padding=1)
         self.conv2 = self._make_cnn_block(
@@ -461,33 +362,44 @@ class SWTformerGenerator(nn.Module):
             int(math.ceil(16 * self.depth)), int(math.ceil(32 * self.depth)))
         self.conv4 = self._make_cnn_block(
             int(math.ceil(32 * self.depth)), int(math.ceil(64 * self.depth)))
+
+        # Transformer部分
         dim = int(math.ceil(64 * self.depth))
         dim_head = dim // 8
-        self.hpb1 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=16,
-                                          attn_width_top_k=16, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
-        self.hpb2 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=16,
-                                          attn_width_top_k=16, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
+        self.hpb1 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=64,  # 增大到 64
+                                          attn_width_top_k=64, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
+        self.hpb2 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=64,
+                                          attn_width_top_k=64, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
+
+        # 解码器
         self.conv6 = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
         self.conv7 = nn.Sequential(
-            nn.Conv2d(dim + int(math.ceil(32 * self.depth)), dim +
-                      int(math.ceil(32 * self.depth)), kernel_size=3, padding=1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
         self.conv8 = nn.Sequential(
-            nn.Conv2d(dim + int(math.ceil(16 * self.depth)) + int(math.ceil(32 * self.depth)), dim + int(
-                math.ceil(16 * self.depth)) + int(math.ceil(32 * self.depth)), kernel_size=3, padding=1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
-        self.conv9 = nn.Conv2d(dim + int(math.ceil(16 * self.depth)) +
-                               int(math.ceil(32 * self.depth)), 3, kernel_size=3, padding=1)
-        self.tanh = nn.Sigmoid()
-        self.concat = lambda x: torch.cat(x, dim=1)
+        self.conv9 = nn.Conv2d(dim, 3, kernel_size=3, padding=1)
+        self.sigmoid = nn.Identity()  # 输出映射到 (0, 1)
+
+        # 投影层
+        self.proj2 = nn.Conv2d(int(math.ceil(
+            8 * self.depth)), int(math.ceil(16 * self.depth)), kernel_size=1, stride=2, padding=0)
+        self.proj3 = nn.Conv2d(int(math.ceil(
+            16 * self.depth)), int(math.ceil(32 * self.depth)), kernel_size=1, stride=2, padding=0)
+        self.proj4 = nn.Conv2d(int(math.ceil(
+            32 * self.depth)), int(math.ceil(64 * self.depth)), kernel_size=1, stride=2, padding=0)
+
+        # 初始化权重
+        self.apply(self.init_weights)
 
     def _make_cnn_block(self, in_channels, out_channels):
         return nn.Sequential(
@@ -497,20 +409,42 @@ class SWTformerGenerator(nn.Module):
             nn.SiLU()
         )
 
+    def init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
     def forward(self, x):
-        # 编码器 (CNN)
         x1 = self.conv1(x)
         x2 = self.conv2(x1)
+        x2 = x2 + 0.1 * self.proj2(x1)  # 添加残差缩放
+        del x1
+
         x3 = self.conv3(x2)
+        x3 = x3 + 0.1 * self.proj3(x2)
+        del x2
+
         x4 = self.conv4(x3)
+        x4 = x4 + 0.1 * self.proj4(x3)
+        del x3
 
-        # Swing Transformer + 混合感知块（HPB） 处理
-        x5 = self.hpb1(x4)
-        x5 = self.hpb2(x5)
+        x5 = self.hpb1(x4) + 0.1 * x4
+        del x4
+        x5 = self.hpb2(x5) + 0.1 * x5
 
-        # 解码器 (CNN + 上采样)
         x6 = self.conv6(x5)
-        x7 = self.conv7(self.concat([x6, x3]))
-        x8 = self.conv8(self.concat([x7, x2]))
-        x9 = self.tanh(self.conv9(x8))
+        x7 = self.conv7(x6)
+        x7 = x7 + 0.1 * \
+            F.interpolate(x6, size=x7.shape[2:],
+                          mode='bilinear', align_corners=True)
+        del x6
+        x8 = self.conv8(x7)
+        x8 = x8 + 0.1 * \
+            F.interpolate(x7, size=x8.shape[2:],
+                          mode='bilinear', align_corners=True)
+        del x7
+        x9 = self.sigmoid(self.conv9(x8))  # 输出 (0, 1)
+        del x8
+
         return x9

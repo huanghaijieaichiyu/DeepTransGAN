@@ -22,21 +22,17 @@ def args():
                         default=random.randint(1, 100000), help="random seed")
     parser.add_argument("--resume", type=str,
                         default='', help="path to two latest checkpoint.")
-    parser.add_argument("--amp", type=bool, default=True,
+    parser.add_argument("--autocast", type=bool, default=True,
                         help="Whether to use amp in mixed precision")
     parser.add_argument("--cuDNN", type=bool, default=False,
                         help="Wether use cuDNN to celerate your program")
-    parser.add_argument("--loss", type=str, default='BCEBlurWithLogitsLoss',
+    parser.add_argument("--loss", type=str, default='bce',
                         choices=['BCEBlurWithLogitsLoss', 'mse', 'bce',
                                  'FocalLoss'], help="loss function")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="learning rate, for adam is 1-e3, SGD is 1-e2")  # 学习率
     parser.add_argument("--momentum", type=float, default=0.5,
                         help="momentum for adam and SGD")
-    parser.add_argument("--depth", type=float, default=1,
-                        help="depth of the generator")
-    parser.add_argument("--weight", type=float, default=1,
-                        help="weight of the generator")
     parser.add_argument("--model", type=str, default="train",
                         help="train or test model")
     parser.add_argument("--b1", type=float, default=0.9,

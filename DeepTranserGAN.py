@@ -32,9 +32,10 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import CNNTransformerGenerator, Generator, Discriminator, Critic, SWTformerGenerator
+from models.base_mode import Generator, Discriminator, Critic, SWTformerGenerator
 from utils.loss import BCEBlurWithLogitsLoss
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
+from torch.backends.cuda import sdp_kernel
 
 
 class BaseTrainer:
@@ -244,13 +245,13 @@ class StandardGANTrainer(BaseTrainer):
         dis_loss = []
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                     bar_format='{l_bar}{bar:10}| {n_fmt}/{total_fmt} {elapsed}', colour='#8762A5')
+
         for i, (low_images, high_images) in pbar:
             low_images = low_images.to(self.device)
             high_images = high_images.to(self.device)
-            with autocast(enabled=self.args.amp):
+            with autocast(enabled=self.args.autocast):
 
                 self.d_optimizer.zero_grad()
-                self.g_optimizer.zero_grad()
                 fake = self.generator(low_images)
                 fake_inputs = self.discriminator(fake.detach())
                 real_inputs = self.discriminator(high_images)
@@ -259,24 +260,28 @@ class StandardGANTrainer(BaseTrainer):
                     fake_inputs.detach(), requires_grad=False)
                 fake_lable = torch.zeros_like(
                     fake_inputs.detach(), requires_grad=False)
+
+                # 先训练判别器
                 d_real_output = self.d_loss(real_inputs, real_lable)
+                d_real_output.backward()
                 d_x = real_inputs.mean().item()
                 d_fake_output = self.d_loss(fake_inputs, fake_lable)
+                d_fake_output.backward()
                 d_g_z1 = fake_inputs.mean().item()
-                d_output = d_real_output.item() + d_fake_output.item()
+                d_output = (d_real_output.item() + d_fake_output.item()) / 2.
+                self.d_optimizer.step()
 
+                # 再训练生成器
+                self.g_optimizer.zero_grad()
                 fake_inputs = self.discriminator(fake.detach())
                 g_output = self.g_loss(fake_inputs, real_lable) + self.stable_loss(
                     fake, high_images)  # 增加像素损失，提高生成图像质量
-
-                d_real_output.backward()
-                d_fake_output.backward()
                 g_output.backward()
                 d_g_z2 = fake_inputs.mean().item()
-                '''torch.nn.utils.clip_grad_norm_(
-                    self.discriminator.parameters(), 1000)
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)'''
-                self.d_optimizer.step()
+                torch.nn.utils.clip_grad_norm_(
+                    self.discriminator.parameters(), 100)
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)
+
                 self.g_optimizer.step()
 
                 gen_loss.append(g_output.item())
@@ -288,9 +293,9 @@ class StandardGANTrainer(BaseTrainer):
                                      % (self.epoch + 1, self.args.epochs, i + 1, len(self.train_loader),
                                         d_output, g_output.item(), d_x, d_g_z1, d_g_z2))
                 self.save_checkpoint()
-                # 学习率调整
+                '''# 学习率调整
                 self.scheduler_g.step()
-                self.scheduler_d.step()
+                self.scheduler_d.step()'''
         self.write_log(self.epoch, gen_loss, dis_loss, d_x, d_g_z1, d_g_z2)
         high_images = high_images.to(self.device)
         fake = fake.to(self.device)
@@ -307,7 +312,7 @@ class WGAN_GPTrainer(BaseTrainer):
         self.c_optimizer, self.g_optimizer = get_opt(
             args, self.generator, self.critic)
 
-    def compute_gradient_penalty(self, real_samples, fake_samples):
+    '''def compute_gradient_penalty(self, real_samples, fake_samples):
         alpha = torch.rand((real_samples.size(0), 1, 1, 1),
                            device=real_samples.device)
         interpolates = (alpha * real_samples + ((1 - alpha)
@@ -321,7 +326,7 @@ class WGAN_GPTrainer(BaseTrainer):
         grad_interpolates = grad_interpolates.view(real_samples.size(0), -1)
         grad_norm = grad_interpolates.norm(2, dim=1)
         grad_penalty = ((grad_norm - 1) ** 2).mean()
-        return grad_penalty
+        return grad_penalty'''
 
     def train_epoch(self):
         self.critic.train()
@@ -330,30 +335,34 @@ class WGAN_GPTrainer(BaseTrainer):
         g_z = 0.
         gen_loss = []
         critic_loss = []
+        n_critic = 5
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                     bar_format='{l_bar}{bar:10}| {n_fmt}/{total_fmt} {elapsed}', colour='#8762A5')
         for i, (low_images, high_images) in pbar:
             low_images = low_images.to(self.device)
             high_images = high_images.to(self.device)
-            with autocast(enabled=self.args.amp):
+            with autocast(enabled=self.args.autocast):
                 self.c_optimizer.zero_grad()
-                self.g_optimizer.zero_grad()
-                fake_images = self.generator(low_images)
-                critic_real = self.critic(high_images)
-                critic_fake = self.critic(fake_images.detach())
-                gradient_penalty = self.compute_gradient_penalty(
-                    high_images, fake_images.detach())
-                loss_critic = -(torch.mean(critic_real) - torch.mean(critic_fake)
-                                ) + self.lambda_gp * gradient_penalty
 
+                # 没训练5次判别器，训练一次生成器
+                for j in range(n_critic):
+                    fake_images = self.generator(low_images)
+                    critic_real = self.critic(high_images)
+                    critic_fake = self.critic(fake_images.detach())
+                    gradient_penalty = compute_gradient_penalty(self.critic,
+                                                                high_images, fake_images.detach())
+                    loss_critic = -(torch.mean(critic_real) - torch.mean(critic_fake)
+                                    ) + self.lambda_gp * gradient_penalty
+                    loss_critic.backward()
+                    self.c_optimizer.step()
+
+                # -------训练生成器------#
+                self.g_optimizer.zero_grad()
                 fake_images = self.generator(low_images)
                 critic_fake = self.critic(fake_images)
                 loss_generator = - \
                     torch.mean(critic_fake) + \
                     self.stable_loss(fake_images, high_images)
-
-                loss_critic.backward()
-                self.c_optimizer.step()
                 loss_generator.backward()
                 self.g_optimizer.step()
 
@@ -375,9 +384,8 @@ class WGAN_GPTrainer(BaseTrainer):
 
 
 def train(args):
-    generator = SWTformerGenerator(args.depth, args.weight)
-    discriminator = Discriminator(
-        batch_size=args.batch_size, img_size=args.img_size[0])
+    generator = SWTformerGenerator()
+    discriminator = Discriminator()
     model_structure(generator, (3, args.img_size[0], args.img_size[1]))
     model_structure(discriminator, (3, args.img_size[0], args.img_size[1]))
     trainer = StandardGANTrainer(args, generator, discriminator)
@@ -385,7 +393,7 @@ def train(args):
 
 
 def train_WGAN(args):
-    generator = Generator(args.depth, args.weight)
+    generator = Generator()
     critic = Critic()
     model_structure(generator, (3, args.img_size[0], args.img_size[1]))
     model_structure(critic, (3, args.img_size[0], args.img_size[1]))

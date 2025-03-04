@@ -1313,7 +1313,7 @@ class Disconv(nn.Module):
         super(Disconv, self).__init__()
         self.conv = Conv2dSame(c1, c2, k, s, groups=g, dilation=d, bias=bias)
         self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
-        self.act = nn.SiLU() if act else nn.Identity()
+        self.act = nn.ReLU() if act else nn.Identity()
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
