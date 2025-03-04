@@ -11,8 +11,6 @@ def args():
                         help="number of epochs of training")  # 迭代次数
     parser.add_argument("--batch_size", type=int, default=16,
                         help="size of the batches")  # batch大小
-    parser.add_argument("--img_size", type=tuple,
-                        default=(256, 256), help="size of the image")
     parser.add_argument("--optimizer", type=str, default='Adam',
                         choices=['AdamW', 'SGD', 'Adam', 'lion', 'rmp'])
     parser.add_argument("--num_workers", type=int, default=0,

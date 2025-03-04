@@ -2,7 +2,8 @@ import math
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-
+import torchvision.models as models
+from torch.nn.utils import spectral_norm
 from models.Repvit import RepViTBlock
 from models.common import SPPELAN, Concat, Disconv, Gencov, PSA
 
@@ -34,7 +35,7 @@ class Generator(BaseNetwork):
         self.depth = depth
         self.weight = weight
 
-        # Define layers
+        # 定义层
         self.conv1 = Gencov(3, math.ceil(8 * self.depth))
         self.conv2 = self._make_sequential(
             math.ceil(8 * self.depth), math.ceil(16 * self.depth), self.weight)
@@ -67,7 +68,7 @@ class Generator(BaseNetwork):
         self.conv9 = Gencov(math.ceil(112 * self.depth), 3,
                             math.ceil(self.weight), act=False, bn=False)
 
-        self.tanh = nn.Sigmoid()
+        self.tanh = nn.Sigmoid()  # 使用 Sigmoid 替代 Tanh，以输出 [0, 1]
         self.concat = Concat()
 
     def _make_sequential(self, in_channels, out_channels, weight):
@@ -80,55 +81,65 @@ class Generator(BaseNetwork):
         )
 
     def forward(self, x):
-        # Encoder
-        x1 = self.conv1(x)
-        x2 = self.conv2(x1)
-        x3 = self.conv3(x2)
-        x4 = self.conv4(x3)
-        x5 = self.conv5(x4)
+        # 检查输入尺寸
+        assert x.shape[2:] == torch.Size(
+            [256, 256]), "输入尺寸必须为 [B, 3, 256, 256]"
 
-        # Decoder
-        x6 = self.conv6(x5)
+        # 编码器
+        x1 = self.conv1(x)  # [B, 8*d, 256, 256]
+        x2 = self.conv2(x1)  # [B, 16*d, 128, 128]
+        x3 = self.conv3(x2)  # [B, 32*d, 64, 64]
+        x4 = self.conv4(x3)  # [B, 64*d, 32, 32]
+        x5 = self.conv5(x4)  # [B, 64*d, 32, 32]
+
+        # 解码器
+        x6 = self.conv6(x5)  # [B, 64*d, 64, 64]
+        # [B, 96*d, 128, 128] (64*d + 32*d)
         x7 = self.conv7(self.concat([x6, x3]))
+        # [B, 112*d, 256, 256] (16*d + 96*d)
         x8 = self.conv8(self.concat([x2, x7]))
-        x9 = self.tanh(self.conv9(x8))
+        x9 = self.tanh(self.conv9(x8))  # [B, 3, 256, 256]
 
-        return x9.view(-1, 3, x.shape[2], x.shape[3])
+        return x9
 
 
 class Discriminator(BaseNetwork):
     """
-    Discriminator model with no activation function
+    Discriminator model with no activation function at the output.
     """
 
-    def __init__(self, batch_size=8, img_size=256):
+    def __init__(self, pretrained=True, fine_tune=True, use_sn=True):
         super().__init__()
-        self.batch_size = batch_size
-        self.ratio = img_size / 256.  # Store ratio as an instance variable
+        resnet50_pretrained = models.resnet50(pretrained=pretrained)
+        features = list(resnet50_pretrained.children())[
+            :-2]  # 去掉 avgpool 和 fc 层，保留到 layer4
+        # 或者更精细地选择 layer:
+        # features = nn.Sequential(resnet50_pretrained.conv1, resnet50_pretrained.bn1, resnet50_pretrained.relu,
+        #                           resnet50_pretrained.maxpool, resnet50_pretrained.layer1, resnet50_pretrained.layer2,
+        #                            resnet50_pretrained.layer3, resnet50_pretrained.layer4)
 
-        # Define layers
-        self.conv_in = nn.Sequential(Disconv(3, 8), RepViTBlock(8, 16, 3, 2))
-        self.conv1 = self._make_sequential(16, 32, 3)
-        self.conv_out = Disconv(4, 1, bn=False, act=False)
-        self.act = nn.Identity()  # BCEWithLogitLOSS 在输入前已经sigmoid，无需再限制输出
+        # 如果不微调，冻结 ResNet 权重
 
-    def _make_sequential(self, in_channels, out_channels, weight):
-        """
-        Creates a sequential block for the discriminator.
-        """
-        return nn.Sequential(
-            RepViTBlock(in_channels, out_channels, weight, 2),
-            Disconv(out_channels, out_channels * 2),  # Increased out_channels
-            RepViTBlock(out_channels * 2, in_channels, weight, 2),
-            Disconv(in_channels, in_channels // 2),  # Reduced out_channels
-            RepViTBlock(in_channels // 2, in_channels // 4, weight, 2),
-            Disconv(in_channels // 4, 4)
-        )
+        if not fine_tune:
+            for param in features.parameters():
+                param.requires_grad = False
+
+        self.features = nn.Sequential(*features)  # 封装为 Sequential 模块
+
+        # 全局平均池化 (Global Average Pooling)
+        self.global_avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # 全连接层 (输出标量)
+        self.classifier = nn.Linear(2048, 1)  # ResNet50 layer4 输出通道数为 2048
+        if use_sn:
+            self.classifier = spectral_norm(self.classifier)
 
     def forward(self, x):
-        x = self.act(self.conv_out(self.conv1(self.conv_in(x)))).view(
-            self.batch_size if x.shape[0] == self.batch_size else x.shape[0], -1)
-        return x
+        features = self.features(x)  # 通过 ResNet 特征提取层
+        pooled_features = self.global_avgpool(features)  # 全局平均池化
+        flattened_features = torch.flatten(pooled_features, 1)  # 展平特征
+        scalar_output = self.classifier(flattened_features)  # 通过分类器得到标量输出
+        return scalar_output  # [B, 1]
 
 
 class Critic(BaseNetwork):
@@ -180,198 +191,157 @@ class Critic(BaseNetwork):
         x = x.view(batch_size, -1)
         return x.mean(dim=1, keepdim=True)  # 输出实数值
 
-# GAN成器
 
-
-class CNNTransformerGenerator(nn.Module):
-    def __init__(self, depth=1, weight=1):
+# 提取图像块的工具类
+class Patches(nn.Module):
+    def __init__(self, patch_size):
         super().__init__()
-        self.depth = depth
-        self.weight = weight
+        self.patch_size = patch_size
 
-        # CNN 编码器部分
-        self.conv1 = nn.Conv2d(3, math.ceil(
-            8 * self.depth), kernel_size=3, stride=1, padding=1)
-        self.conv2 = self._make_cnn_block(
-            math.ceil(8 * self.depth), math.ceil(16 * self.depth))
-        self.conv3 = self._make_cnn_block(
-            math.ceil(16 * self.depth), math.ceil(32 * self.depth))
-        self.conv4 = self._make_cnn_block(
-            math.ceil(32 * self.depth), math.ceil(64 * self.depth))
+    def forward(self, images):
+        B, C, H, W = images.shape
+        assert H % self.patch_size == 0 and W % self.patch_size == 0, "图像尺寸必须能被块大小整除"
+        # 提取图像块
+        patches = images.unfold(2, self.patch_size, self.patch_size).unfold(
+            3, self.patch_size, self.patch_size)
+        patches = patches.contiguous().view(B, C, -1, self.patch_size, self.patch_size)
+        patches = patches.permute(0, 2, 1, 3, 4).contiguous().view(
+            B, -1, C * self.patch_size * self.patch_size)
+        return patches
 
-        # Transformer 部分
-        transformer_layers = nn.TransformerEncoderLayer(
-            d_model=math.ceil(64 * self.depth),
-            nhead=8,
-            dim_feedforward=math.ceil(128 * self.depth),
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            transformer_layers, num_layers=2)
-
-        # CNN 解码器部分
-        self.conv6 = nn.Sequential(
-            nn.Conv2d(math.ceil(64 * self.depth), math.ceil(64 *
-                      self.depth), kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.conv7 = nn.Sequential(
-            nn.Conv2d(math.ceil(96 * self.depth), math.ceil(96 *
-                      self.depth), kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.conv8 = nn.Sequential(
-            nn.Conv2d(math.ceil(112 * self.depth),
-                      math.ceil(112 * self.depth), kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.conv9 = nn.Conv2d(math.ceil(112 * self.depth),
-                               3, kernel_size=3, padding=1)
-
-        self.tanh = nn.Sigmoid()
-        self.concat = lambda x: torch.cat(x, dim=1)  # 简单实现 Concat
-
-    def _make_cnn_block(self, in_channels, out_channels):
-        """创建 CNN 块：卷积 + BN + ReLU + 下采样"""
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels,
-                      kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU()
-        )
-
-    def forward(self, x):
-        # 编码器 (CNN)
-        x1 = self.conv1(x)  # (B, 8*d, H, W)
-        x2 = self.conv2(x1)  # (B, 16*d, H/2, W/2)
-        x3 = self.conv3(x2)  # (B, 32*d, H/4, W/4)
-        x4 = self.conv4(x3)  # (B, 64*d, H/8, W/8)
-
-        # Transformer 处理
-        B, C, H, W = x4.shape
-        x4_flat = x4.view(B, C, H * W).permute(0, 2, 1)  # (B, H*W, 64*d)
-        x5 = self.transformer(x4_flat)  # (B, H*W, 64*d)
-        x5 = x5.permute(0, 2, 1).view(B, C, H, W)  # (B, 64*d, H/8, W/8)
-
-        # 解码器 (CNN + 上采样)
-        x6 = self.conv6(x5)  # (B, 64*d, H/4, W/4)
-        x7 = self.conv7(self.concat([x6, x3]))  # (B, 96*d, H/2, W/2)
-        x8 = self.conv8(self.concat([x7, x2]))  # (B, 112*d, H, W)
-        x9 = self.tanh(self.conv9(x8))  # (B, 3, H, W)
-
-        return x9
+# 修改后的双重裁剪自注意力模块，适配 ViT
 
 
 class DualPrunedSelfAttn(nn.Module):
-    def __init__(self, dim, dim_head, heads, height_top_k, width_top_k, dropout=0.):
+    def __init__(self, dim, num_heads, dim_head, height_top_k, width_top_k, dropout=0.):
         super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head
-        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.to_out = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.height_top_k = height_top_k
-        self.width_top_k = width_top_k
+        self.num_heads = num_heads  # 注意力头数
+        self.dim_head = dim_head    # 每个头的维度
+        self.scale = dim_head ** -0.5  # 缩放因子
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)  # Q、K、V 投影
+        self.to_out = nn.Linear(dim, dim)  # 输出投影
+        self.dropout = nn.Dropout(dropout)  # Dropout 层
+        self.height_top_k = height_top_k  # 高度方向裁剪的 top-k
+        self.width_top_k = width_top_k    # 宽度方向裁剪的 top-k
+
+    def prune_attn(self, attn, height_top_k, width_top_k):
+        B, H, N, _ = attn.shape
+        device = attn.device
+        # 动态调整 k，确保不超过 N
+        height_k = min(height_top_k, N)
+        width_k = min(width_top_k, N)
+
+        # 裁剪行
+        row_scores = attn.mean(dim=-1)  # 按列平均，形状 [B, H, N]
+        _, top_row_idx = row_scores.topk(height_k, dim=-1)
+        row_mask = torch.zeros(B, H, N, device=device)
+        row_mask.scatter_(-1, top_row_idx, 1)
+        row_mask = row_mask.unsqueeze(-1).expand(B, H, N, N)
+
+        # 裁剪列
+        col_scores = attn.mean(dim=-2)  # 按行平均，形状 [B, H, N]
+        _, top_col_idx = col_scores.topk(width_k, dim=-1)
+        col_mask = torch.zeros(B, H, N, device=device)
+        col_mask.scatter_(-1, top_col_idx, 1)
+        col_mask = col_mask.unsqueeze(-2).expand(B, H, N, N)
+
+        # 合并掩码
+        mask = row_mask * col_mask
+        return attn * mask
 
     def forward(self, x):
-        B, N, C = x.size()
+        B, N, C = x.size()  # 输入形状：[批次，块数，通道]
+        # 生成 Q、K、V
         qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(B, N, self.heads,
-                      self.dim_head).transpose(1, 2), qkv)
-        attn = torch.einsum('b h i d, b h j d -> b h i j',
-                            q, k) * (self.dim_head ** -0.5)
+        q, k, v = map(lambda t: t.view(B, N, self.num_heads,
+                                       self.dim_head).transpose(1, 2), qkv)
+        # 计算注意力分数
+        attn = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        # 应用裁剪
         attn = self.prune_attn(attn, self.height_top_k, self.width_top_k)
+        # Softmax 和 Dropout
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
+        # 加权和
         out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
         out = out.transpose(1, 2).contiguous().view(B, N, C)
         out = self.to_out(out)
         return out
 
-    def prune_attn(self, attn, height_top_k, width_top_k):
-        B, H, N, _ = attn.shape
-        device = attn.device
-        row_scores = attn.mean(dim=-1)
-        _, top_row_idx = row_scores.topk(height_top_k, dim=-1)
-        row_mask = torch.zeros(B, H, N, device=device)
-        row_mask.scatter_(-1, top_row_idx, 1)
-        row_mask = row_mask.unsqueeze(-1).expand(B, H, N, N)
-        col_scores = attn.mean(dim=-2)
-        _, top_col_idx = col_scores.topk(width_top_k, dim=-1)
-        col_mask = torch.zeros(B, H, N, device=device)
-        col_mask.scatter_(-1, top_col_idx, 1)
-        col_mask = col_mask.unsqueeze(-2).expand(B, H, N, N)
-        mask = row_mask * col_mask
-        return attn * mask
-
-# Hybrid Perception Block
+# ViT 风格的混合感知块
 
 
-class HybridPerceptionBlock(nn.Module):
-    def __init__(self, dim, dim_head, heads, attn_height_top_k, attn_width_top_k, attn_dropout, ff_mult, ff_dropout):
+class ViTHybridBlock(nn.Module):
+    def __init__(self, dim, num_heads, dim_head, height_top_k, width_top_k, ff_mult=4, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)  # 第一层归一化
         self.attn = DualPrunedSelfAttn(
-            dim, dim_head, heads, attn_height_top_k, attn_width_top_k, dropout=attn_dropout)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.ff = nn.ModuleList([
-            nn.Linear(dim, dim * ff_mult),
-            nn.GELU(),  # 使用 GELU 避免梯度消失
-            nn.Dropout(ff_dropout),
-            nn.Linear(dim * ff_mult, dim),
-        ])
-        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+            dim, num_heads, dim_head, height_top_k, width_top_k, dropout)
+        self.conv = nn.Conv2d(dim, dim, kernel_size=3,
+                              padding=1, groups=dim)  # 深度卷积
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)  # 第二层归一化
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * ff_mult),  # 前馈网络扩展
+            nn.GELU(),                      # GELU 激活
+            nn.Dropout(dropout),            # Dropout
+            nn.Linear(dim * ff_mult, dim)   # 前馈网络缩减
+        )
 
     def forward(self, x):
-        B, C, H, W = x.size()
-        x_attn = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
-        x_attn = self.norm1(x_attn)
-        x_attn = self.attn(x_attn)
-        x_attn = x_attn.view(B, H, W, C).permute(0, 3, 1, 2)
-        x_conv = self.conv(x)
+        B, N, C = x.size()  # 输入为块序列
+        # 注意力路径
+        x_attn = self.attn(self.norm1(x))
+        # 重塑为图像以进行卷积
+        H = W = int(N ** 0.5)  # 假设块网格为方形
+        x_conv = x.view(B, C, H, W)
+        x_conv = self.conv(x_conv)
+        x_conv = x_conv.view(B, N, C)
+        # 合并注意力与卷积结果
         x = x_attn + x_conv
-        normed = self.norm2(x.permute(0, 2, 3, 1))
-        normed = normed.contiguous().view(B * H * W, C)
-        ff_out = self.ff[0](normed)
-        ff_out = self.ff[1](ff_out)
-        ff_out = self.ff[2](ff_out)
-        ff_out = self.ff[3](ff_out)
-        ff_out = ff_out.view(B, H, W, C).permute(0, 3, 1, 2)
-        x = x + ff_out
+        # 前馈路径
+        x = x + self.ff(self.norm2(x))
         return x
 
-# 更新后的生成器
+# 更新后的生成器，固定输入尺寸为 [B, 3, 256, 256]
 
 
 class SWTformerGenerator(nn.Module):
-    def __init__(self, depth=1, weight=1):
+    def __init__(self, depth=1, weight=1, patch_size=16, num_heads=8, height_top_k=64, width_top_k=64):
         super().__init__()
         self.depth = depth
         self.weight = weight
+        self.patch_size = patch_size
+        self.img_size = (256, 256)  # 固定输入尺寸为 256x256
 
-        # 编码器
-        self.conv1 = nn.Conv2d(
-            3, int(math.ceil(8 * self.depth)), kernel_size=3, stride=1, padding=1)
+        # 编码器 (CNN)
+        self.conv1 = nn.Conv2d(3, int(math.ceil(8 * depth)),
+                               kernel_size=3, stride=1, padding=1)
         self.conv2 = self._make_cnn_block(
-            int(math.ceil(8 * self.depth)), int(math.ceil(16 * self.depth)))
+            int(math.ceil(8 * depth)), int(math.ceil(16 * depth)))
         self.conv3 = self._make_cnn_block(
-            int(math.ceil(16 * self.depth)), int(math.ceil(32 * self.depth)))
+            int(math.ceil(16 * depth)), int(math.ceil(32 * depth)))
         self.conv4 = self._make_cnn_block(
-            int(math.ceil(32 * self.depth)), int(math.ceil(64 * self.depth)))
+            int(math.ceil(32 * depth)), int(math.ceil(64 * depth)))
 
-        # Transformer部分
-        dim = int(math.ceil(64 * self.depth))
-        dim_head = dim // 8
-        self.hpb1 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=64,  # 增大到 64
-                                          attn_width_top_k=64, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
-        self.hpb2 = HybridPerceptionBlock(dim, dim_head, heads=8, attn_height_top_k=64,
-                                          attn_width_top_k=64, attn_dropout=0.1, ff_mult=2, ff_dropout=0.1)
+        # 块嵌入
+        dim = int(math.ceil(64 * depth))
+        self.patch_embed = nn.Linear(patch_size * patch_size * dim, dim)
+        # 固定输入 256x256，编码器缩小 8 倍，特征图为 32x32
+        self.feat_h = 256 // 8  # 32
+        self.feat_w = 256 // 8  # 32
+        self.num_patches = (self.feat_h // patch_size) *\
+            (self.feat_w // patch_size)  # 4 (对于 patch_size=16)
+        self.pos_embed = nn.Parameter(torch.zeros(
+            1, self.num_patches, dim))  # [1, 4, dim]
 
-        # 解码器
+        # Transformer 部分 (ViT 风格)
+        self.transformer = nn.ModuleList([
+            ViTHybridBlock(dim, num_heads, dim // num_heads,
+                           height_top_k, width_top_k, ff_mult=4, dropout=0.1)
+            for _ in range(2)  # 两层 Transformer
+        ])
+
+        # 解码器 (CNN)
         self.conv6 = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
@@ -388,15 +358,15 @@ class SWTformerGenerator(nn.Module):
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         )
         self.conv9 = nn.Conv2d(dim, 3, kernel_size=3, padding=1)
-        self.sigmoid = nn.Identity()  # 输出映射到 (0, 1)
+        self.sigmoid = nn.Sigmoid()  # 输出映射到 (0, 1)
 
-        # 投影层
+        # 投影层用于残差连接
         self.proj2 = nn.Conv2d(int(math.ceil(
-            8 * self.depth)), int(math.ceil(16 * self.depth)), kernel_size=1, stride=2, padding=0)
+            8 * depth)), int(math.ceil(16 * depth)), kernel_size=1, stride=2, padding=0)
         self.proj3 = nn.Conv2d(int(math.ceil(
-            16 * self.depth)), int(math.ceil(32 * self.depth)), kernel_size=1, stride=2, padding=0)
+            16 * depth)), int(math.ceil(32 * depth)), kernel_size=1, stride=2, padding=0)
         self.proj4 = nn.Conv2d(int(math.ceil(
-            32 * self.depth)), int(math.ceil(64 * self.depth)), kernel_size=1, stride=2, padding=0)
+            32 * depth)), int(math.ceil(64 * depth)), kernel_size=1, stride=2, padding=0)
 
         # 初始化权重
         self.apply(self.init_weights)
@@ -416,35 +386,40 @@ class SWTformerGenerator(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
+        # 输入检查
+        assert x.shape[2:] == torch.Size(
+            [256, 256]), "输入尺寸必须为 [B, 3, 256, 256]"
+
+        # 编码器
         x1 = self.conv1(x)
-        x2 = self.conv2(x1)
-        x2 = x2 + 0.1 * self.proj2(x1)  # 添加残差缩放
-        del x1
+        x2 = self.conv2(x1) + 0.1 * self.proj2(x1)
+        x3 = self.conv3(x2) + 0.1 * self.proj3(x2)
+        x4 = self.conv4(x3) + 0.1 * self.proj4(x3)
 
-        x3 = self.conv3(x2)
-        x3 = x3 + 0.1 * self.proj3(x2)
-        del x2
+        # 块嵌入与 Transformer
+        patches = Patches(self.patch_size)(x4)
+        x5 = self.patch_embed(patches) + self.pos_embed
+        for block in self.transformer:
+            x5 = block(x5)
 
-        x4 = self.conv4(x3)
-        x4 = x4 + 0.1 * self.proj4(x3)
-        del x3
+        # 重塑回图像格式，使用编码器输出尺寸
+        B, N, C = x5.shape
+        x5 = x5.view(B, self.feat_h // self.patch_size,
+                     self.feat_w // self.patch_size, C).permute(0, 3, 1, 2)
 
-        x5 = self.hpb1(x4) + 0.1 * x4
-        del x4
-        x5 = self.hpb2(x5) + 0.1 * x5
-
-        x6 = self.conv6(x5)
-        x7 = self.conv7(x6)
-        x7 = x7 + 0.1 * \
-            F.interpolate(x6, size=x7.shape[2:],
-                          mode='bilinear', align_corners=True)
-        del x6
-        x8 = self.conv8(x7)
-        x8 = x8 + 0.1 * \
-            F.interpolate(x7, size=x8.shape[2:],
-                          mode='bilinear', align_corners=True)
-        del x7
-        x9 = self.sigmoid(self.conv9(x8))  # 输出 (0, 1)
-        del x8
+        # 解码器
+        x6 = self.conv6(x5)  # 2x2 -> 4x4
+        x7_temp = self.conv7(x6)  # 4x4 -> 8x8
+        x7 = x7_temp + 0.1 *\
+            F.interpolate(
+                x6, size=x7_temp.shape[2:], mode='bilinear', align_corners=True)
+        x8_temp = self.conv8(x7)  # 8x8 -> 16x16
+        x8 = x8_temp + 0.1 *\
+            F.interpolate(
+                x7, size=x8_temp.shape[2:], mode='bilinear', align_corners=True)
+        # 最终调整到 256x256
+        x9 = F.interpolate(x8, size=self.img_size,
+                           mode='bilinear', align_corners=True)
+        x9 = self.sigmoid(self.conv9(x9))
 
         return x9

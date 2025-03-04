@@ -23,6 +23,7 @@ import imageio
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.optim.lr_scheduler import StepLR
 from torch.utils import tensorboard
@@ -40,6 +41,7 @@ from torch.backends.cuda import sdp_kernel
 
 class BaseTrainer:
     def __init__(self, args, generator, discriminator=None, critic=None):
+        self.n_pretain = 5
         self.args = args
         self.generator = generator
         self.discriminator = discriminator
@@ -55,7 +57,7 @@ class BaseTrainer:
             self.critic = self.critic.to(self.device)
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((args.img_size[0], args.img_size[1])),
+            transforms.Resize((256, 256)),
             transforms.ToTensor()
         ])
         self.train_data = LowLightDataset(
@@ -234,7 +236,7 @@ class BaseTrainer:
 class StandardGANTrainer(BaseTrainer):
     def __init__(self, args, generator, discriminator):
         super().__init__(args, generator, discriminator=discriminator)
-        self.d_loss = BCEBlurWithLogitsLoss().to(self.device)
+        self.d_loss = nn.BCEWithLogitsLoss().to(self.device)
 
     def train_epoch(self):
         self.discriminator.train()
@@ -250,26 +252,27 @@ class StandardGANTrainer(BaseTrainer):
             low_images = low_images.to(self.device)
             high_images = high_images.to(self.device)
             with autocast(enabled=self.args.autocast):
+                for j in range(self.n_pretain):
+                    self.d_optimizer.zero_grad()
+                    fake = self.generator(low_images)
+                    fake_inputs = self.discriminator(fake.detach())
+                    real_inputs = self.discriminator(high_images)
 
-                self.d_optimizer.zero_grad()
-                fake = self.generator(low_images)
-                fake_inputs = self.discriminator(fake.detach())
-                real_inputs = self.discriminator(high_images)
+                    real_lable = torch.ones_like(
+                        fake_inputs.detach(), requires_grad=False)
+                    fake_lable = torch.zeros_like(
+                        fake_inputs.detach(), requires_grad=False)
 
-                real_lable = torch.ones_like(
-                    fake_inputs.detach(), requires_grad=False)
-                fake_lable = torch.zeros_like(
-                    fake_inputs.detach(), requires_grad=False)
-
-                # 先训练判别器
-                d_real_output = self.d_loss(real_inputs, real_lable)
-                d_real_output.backward()
-                d_x = real_inputs.mean().item()
-                d_fake_output = self.d_loss(fake_inputs, fake_lable)
-                d_fake_output.backward()
-                d_g_z1 = fake_inputs.mean().item()
-                d_output = (d_real_output.item() + d_fake_output.item()) / 2.
-                self.d_optimizer.step()
+                    # 先训练判别器
+                    d_real_output = self.d_loss(real_inputs, real_lable)
+                    d_real_output.backward()
+                    d_x = real_inputs.mean().item()
+                    d_fake_output = self.d_loss(fake_inputs, fake_lable)
+                    d_fake_output.backward()
+                    d_g_z1 = fake_inputs.mean().item()
+                    d_output = (d_real_output.item() +
+                                d_fake_output.item()) / 2.
+                    self.d_optimizer.step()
 
                 # 再训练生成器
                 self.g_optimizer.zero_grad()
@@ -312,22 +315,6 @@ class WGAN_GPTrainer(BaseTrainer):
         self.c_optimizer, self.g_optimizer = get_opt(
             args, self.generator, self.critic)
 
-    '''def compute_gradient_penalty(self, real_samples, fake_samples):
-        alpha = torch.rand((real_samples.size(0), 1, 1, 1),
-                           device=real_samples.device)
-        interpolates = (alpha * real_samples + ((1 - alpha)
-                        * fake_samples)).requires_grad_(True)
-        critic_interpolates = self.critic(interpolates)
-        grad_outputs = torch.ones(critic_interpolates.size(
-        ), device=real_samples.device, requires_grad=False)
-        grad_interpolates = torch.autograd.grad(outputs=critic_interpolates, inputs=interpolates,
-                                                grad_outputs=grad_outputs, create_graph=True, retain_graph=True,
-                                                only_inputs=True)[0]
-        grad_interpolates = grad_interpolates.view(real_samples.size(0), -1)
-        grad_norm = grad_interpolates.norm(2, dim=1)
-        grad_penalty = ((grad_norm - 1) ** 2).mean()
-        return grad_penalty'''
-
     def train_epoch(self):
         self.critic.train()
         self.generator.train()
@@ -335,7 +322,6 @@ class WGAN_GPTrainer(BaseTrainer):
         g_z = 0.
         gen_loss = []
         critic_loss = []
-        n_critic = 5
         pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                     bar_format='{l_bar}{bar:10}| {n_fmt}/{total_fmt} {elapsed}', colour='#8762A5')
         for i, (low_images, high_images) in pbar:
@@ -345,7 +331,7 @@ class WGAN_GPTrainer(BaseTrainer):
                 self.c_optimizer.zero_grad()
 
                 # 没训练5次判别器，训练一次生成器
-                for j in range(n_critic):
+                for j in range(self.n_pretain):
                     fake_images = self.generator(low_images)
                     critic_real = self.critic(high_images)
                     critic_fake = self.critic(fake_images.detach())
@@ -386,8 +372,8 @@ class WGAN_GPTrainer(BaseTrainer):
 def train(args):
     generator = SWTformerGenerator()
     discriminator = Discriminator()
-    model_structure(generator, (3, args.img_size[0], args.img_size[1]))
-    model_structure(discriminator, (3, args.img_size[0], args.img_size[1]))
+    model_structure(generator, (3, 256, 256))
+    model_structure(discriminator, (3, 256, 256))
     trainer = StandardGANTrainer(args, generator, discriminator)
     trainer.train()
 
@@ -395,8 +381,8 @@ def train(args):
 def train_WGAN(args):
     generator = Generator()
     critic = Critic()
-    model_structure(generator, (3, args.img_size[0], args.img_size[1]))
-    model_structure(critic, (3, args.img_size[0], args.img_size[1]))
+    model_structure(generator, (3, 256, 256))
+    model_structure(critic, (3, 256, 256))
     trainer = WGAN_GPTrainer(args, generator, critic)
     trainer.train()
 
@@ -408,7 +394,6 @@ class BasePredictor:
         if args.device == 'cuda':
             self.device = torch.device(
                 'cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.img_size = args.img_size
         self.data = args.data
         self.model = args.model
         self.batch_size = args.batch_size
@@ -416,14 +401,14 @@ class BasePredictor:
         self.save_path = args.save_path
         self.generator = Generator(1, 1)
         model_structure(
-            self.generator, (3, self.img_size[0], self.img_size[1]))
+            self.generator, (3, 256, 256))
         checkpoint = torch.load(self.model)
         self.generator.load_state_dict(checkpoint['net'])
         self.generator.to(self.device)
         self.generator.eval()
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((self.img_size[0], self.img_size[1])),
+            transforms.Resize((256, 256)),
             transforms.ToTensor(),
             # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
