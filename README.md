@@ -10,6 +10,28 @@
 - 完善的评估指标（PSNR、SSIM）
 - 支持图像和视频处理
 
+## 效果展示
+
+### 图像增强效果
+
+下面展示了模型对低光照图像的增强效果：
+
+| 输入（低光照） | 输出（增强后） |
+|:-------------:|:-------------:|
+| ![低光照图像](examples/real.png) | ![增强后图像](examples/fake.png) |
+
+### 视频增强效果
+
+您可以通过以下链接查看和下载示例视频：
+
+- 处理前视频：[下载链接](https://cloud.189.cn/web/share?code=YJVnyqqYJBru)（访问码：8lkp）
+- 处理后视频：[下载链接](https://cloud.189.cn/web/share?code=J3q2uyiMRJvi)（访问码：lmw6）
+
+### 预训练模型
+
+我们提供了基于KITTI数据集训练的预训练模型：
+- 模型下载：[下载链接](https://cloud.189.cn/web/share?code=2yuIVbFreMjq)（访问码：rbr4）
+
 ## 环境要求
 
 - Python 3.8+

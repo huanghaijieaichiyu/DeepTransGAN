@@ -17,7 +17,7 @@ def args():
                         help="number of data loading workers, if in windows, must be 0"
                         )
     parser.add_argument("--seed", type=int,
-                        default=42, help="random seed")
+                        default=random.randint(0, 1000000), help="random seed")
     parser.add_argument("--resume", type=str,
                         default='', help="path to two latest checkpoint.")
     parser.add_argument("--autocast", type=bool, default=True,

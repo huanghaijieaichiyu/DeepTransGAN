@@ -447,3 +447,264 @@ class LightSWTformer(nn.Module):
 
 # 保留原始类名作为别名，以保持向后兼容性
 SWTformerGenerator = LightSWTformer
+
+
+class DenseAttentionGenerator(BaseNetwork):
+    def __init__(self, in_channels=3, out_channels=3, init_features=64, growth_rate=32, num_dense_layers=4):
+        super().__init__()
+        self.init_features = init_features
+        self.growth_rate = growth_rate
+
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, init_features, kernel_size=7, padding=3),
+            nn.BatchNorm2d(init_features),
+            nn.ReLU(inplace=True)
+        )
+
+        # Encoder Dense Blocks
+        self.dense1 = self._make_dense_block(init_features, num_dense_layers)
+        curr_channels = init_features + growth_rate * num_dense_layers
+        self.trans1 = self._make_transition(curr_channels, curr_channels // 2)
+        curr_channels = curr_channels // 2
+
+        self.dense2 = self._make_dense_block(curr_channels, num_dense_layers)
+        prev_channels = curr_channels
+        curr_channels = curr_channels + growth_rate * num_dense_layers
+        self.trans2 = self._make_transition(curr_channels, curr_channels // 2)
+        curr_channels = curr_channels // 2
+
+        # Bottleneck with Self-Attention
+        self.attention = SelfAttentionBlock(curr_channels)
+
+        # Decoder with Skip Connections
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(curr_channels, prev_channels,
+                               kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(prev_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(prev_channels * 2, init_features,
+                               kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(init_features),
+            nn.ReLU(inplace=True)
+        )
+
+        # Multi-scale Feature Fusion
+        self.msff = MultiScaleFeatureFusion(init_features)
+
+        # Output convolution
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(init_features, out_channels, kernel_size=7, padding=3),
+            nn.Sigmoid()
+        )
+
+    def _make_dense_layer(self, in_channels):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, self.growth_rate, kernel_size=3, padding=1),
+            nn.BatchNorm2d(self.growth_rate),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.growth_rate, self.growth_rate,
+                      kernel_size=3, padding=1)
+        )
+
+    def _make_dense_block(self, in_channels, num_layers):
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_dense_layer(
+                in_channels + i * self.growth_rate))
+        return nn.ModuleList(layers)
+
+    def _make_transition(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        # Initial convolution
+        x1 = self.conv1(x)
+
+        # Dense Block 1
+        x2 = x1
+        for layer in self.dense1:
+            out = layer(x2)
+            x2 = torch.cat([x2, out], dim=1)
+        x2 = self.trans1(x2)
+
+        # Dense Block 2
+        x3 = x2
+        for layer in self.dense2:
+            out = layer(x3)
+            x3 = torch.cat([x3, out], dim=1)
+        x3 = self.trans2(x3)
+
+        # Self-Attention
+        x3 = self.attention(x3)
+
+        # Decoder with Skip Connections
+        x = self.up1(x3)
+        x = torch.cat([x, x2], dim=1)
+        x = self.up2(x)
+        x = torch.cat([x, x1], dim=1)
+
+        # Multi-scale Feature Fusion
+        x = self.msff(x)
+
+        # Output
+        x = self.out_conv(x)
+        return x
+
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, channels, height, width = x.size()
+
+        # Compute query, key, value
+        query = self.query(x).view(
+            batch_size, -1, height * width).permute(0, 2, 1)
+        key = self.key(x).view(batch_size, -1, height * width)
+        value = self.value(x).view(batch_size, -1, height * width)
+
+        # Compute attention
+        attention = torch.bmm(query, key)
+        attention = F.softmax(attention, dim=-1)
+
+        # Apply attention to value
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, channels, height, width)
+
+        # Residual connection
+        return self.gamma * out + x
+
+
+class MultiScaleFeatureFusion(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            nn.ReLU(inplace=True)
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=5, padding=2),
+            nn.ReLU(inplace=True)
+        )
+        self.branch4 = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            nn.ReLU(inplace=True)
+        )
+        self.conv = nn.Conv2d(channels, channels, kernel_size=1)
+
+    def forward(self, x):
+        branch1 = self.branch1(x)
+        branch2 = self.branch2(x)
+        branch3 = self.branch3(x)
+        branch4 = self.branch4(x)
+        out = torch.cat([branch1, branch2, branch3, branch4], dim=1)
+        return self.conv(out)
+
+
+class HybridGenerator(BaseNetwork):
+    def __init__(self, in_channels=3, out_channels=3, init_features=64, depth=1, weight=1):
+        super().__init__()
+        self.depth = depth
+        self.weight = weight
+        self.init_features = init_features
+
+        # 初始特征提取
+        self.init_conv = Gencov(in_channels, init_features)
+
+        # 编码器阶段
+        self.encoder1 = self._make_encoder_block(
+            init_features, init_features*2)
+        self.encoder2 = self._make_encoder_block(
+            init_features*2, init_features*4)
+        self.encoder3 = self._make_encoder_block(
+            init_features*4, init_features*8)
+
+        # 瓶颈层
+        self.bottleneck = nn.Sequential(
+            SPPELAN(init_features*8, init_features*8, init_features*4),
+            PSA(init_features*8, init_features*8),
+            RepViTBlock(init_features*8, init_features*8, 1, 1, 0, 0)
+        )
+
+        # 解码器阶段
+        self.decoder3 = self._make_decoder_block(
+            init_features*16, init_features*4)
+        self.decoder2 = self._make_decoder_block(
+            init_features*8, init_features*2)
+        self.decoder1 = self._make_decoder_block(
+            init_features*4, init_features)
+
+        # 输出层
+        self.output_conv = nn.Sequential(
+            Gencov(init_features*2, init_features),
+            Gencov(init_features, out_channels, act=False, bn=False),
+            nn.Sigmoid()
+        )
+
+        # 特征融合权重
+        self.fusion_weights = nn.Parameter(torch.ones(3, 1))
+        self.softmax = nn.Softmax(dim=0)
+
+    def _make_encoder_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            RepViTBlock(in_channels, out_channels, math.ceil(self.weight), 2),
+            RepViTBlock(out_channels, out_channels, 1, 1, 0, 0),
+            PSA(out_channels, out_channels)
+        )
+
+    def _make_decoder_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            RepViTBlock(in_channels, out_channels, math.ceil(self.weight), 1),
+            RepViTBlock(out_channels, out_channels, 1, 1, 0, 0),
+            PSA(out_channels, out_channels),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        )
+
+    def forward(self, x):
+        # 检查输入尺寸
+        assert x.shape[2:] == torch.Size(
+            [256, 256]), "输入尺寸必须为 [B, 3, 256, 256]"
+
+        # 初始特征提取
+        x0 = self.init_conv(x)
+
+        # 编码器路径
+        e1 = self.encoder1(x0)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
+
+        # 瓶颈
+        b = self.bottleneck(e3)
+
+        # 解码器路径与跳跃连接
+        weights = self.softmax(self.fusion_weights)
+
+        d3 = self.decoder3(torch.cat([b, e3 * weights[0]], dim=1))
+        d2 = self.decoder2(torch.cat([d3, e2 * weights[1]], dim=1))
+        d1 = self.decoder1(torch.cat([d2, e1 * weights[2]], dim=1))
+
+        # 输出
+        out = self.output_conv(torch.cat([d1, x0], dim=1))
+
+        return out
