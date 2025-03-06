@@ -1212,24 +1212,53 @@ class Attention(nn.Module):
 
 class PSA(nn.Module):
 
+    '''
+    参照YOLOv10中PSA模块进行改进，源代码地址：
+
+    '''
+
     def __init__(self, c1, c2, e=0.5):
         super().__init__()
-        assert (c1 == c2)
-        self.c = int(c1 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv(2 * self.c, c1, 1)
+        assert c1 == c2, "输入和输出通道数必须相等"
+        self.c1 = c1
+        self.c = int(c1 * e)  # 减少的通道数用于注意力分支
 
-        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=self.c // 16)
+        # 输入卷积：拆分通道
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+
+        # 注意力分支
+        self.attn = Attention(self.c, attn_ratio=0.5,
+                              num_heads=max(self.c // 32, 1))  # 动态调整 heads
+
+        # FFN 分支：增强特征表达
         self.ffn = nn.Sequential(
             Conv(self.c, self.c * 2, 1),
+            nn.GELU(),  # 使用 GELU 替代默认激活函数，提升非线性
             Conv(self.c * 2, self.c, 1, act=False)
         )
 
+        # 输出卷积：融合分支
+        self.cv2 = Conv(2 * self.c, c1, 1)
+
+        # 残差连接的缩放因子
+        self.res_scale = nn.Parameter(torch.ones(1) * 0.1)  # 可学习的残差权重
+
     def forward(self, x):
-        a, b = self.cv1(x).split((self.c, self.c), dim=1)
-        b = b + self.attn(b)
-        b = b + self.ffn(b)
-        return self.cv2(torch.cat((a, b), 1))
+        # 原始输入保留用于残差
+        identity = x
+
+        # 分割为两个分支
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)  # a: 直通分支, b: 注意力分支
+
+        # 注意力分支处理
+        b = b + self.attn(b)  # 残差连接
+        b = b + self.ffn(b)   # FFN 增强
+
+        # 融合分支
+        out = self.cv2(torch.cat((a, b), dim=1))
+
+        # 可学习的残差连接
+        return out + self.res_scale * identity
 
 
 class SCDown(nn.Module):

@@ -105,91 +105,51 @@ class Generator(BaseNetwork):
 
 class Discriminator(BaseNetwork):
     """
-    Discriminator model with no activation function at the output.
+    Discriminator model with no activation function
     """
 
-    def __init__(self, pretrained=True, fine_tune=True, use_sn=True):
+    def __init__(self, depth=1, weight=1):
         super().__init__()
-        resnet50_pretrained = models.resnet50(pretrained=pretrained)
-        features = list(resnet50_pretrained.children())[
-            :-2]  # 去掉 avgpool 和 fc 层，保留到 layer4
-        # 或者更精细地选择 layer:
-        # features = nn.Sequential(resnet50_pretrained.conv1, resnet50_pretrained.bn1, resnet50_pretrained.relu,
-        #                           resnet50_pretrained.maxpool, resnet50_pretrained.layer1, resnet50_pretrained.layer2,
-        #                            resnet50_pretrained.layer3, resnet50_pretrained.layer4)
+        self.depth = depth
+        self.weight = weight
 
-        # 如果不微调，冻结 ResNet 权重
-
-        if not fine_tune:
-            for param in features.parameters():
-                param.requires_grad = False
-
-        self.features = nn.Sequential(*features)  # 封装为 Sequential 模块
-
-        # 全局平均池化 (Global Average Pooling)
-        self.global_avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # 全连接层 (输出标量)
-        self.classifier = nn.Linear(2048, 1)  # ResNet50 layer4 输出通道数为 2048
-        if use_sn:
-            self.classifier = spectral_norm(self.classifier)
-
-    def forward(self, x):
-        features = self.features(x)  # 通过 ResNet 特征提取层
-        pooled_features = self.global_avgpool(features)  # 全局平均池化
-        flattened_features = torch.flatten(pooled_features, 1)  # 展平特征
-        scalar_output = self.classifier(flattened_features)  # 通过分类器得到标量输出
-        return scalar_output  # [B, 1]
-
-
-class Critic(BaseNetwork):
-    """
-    Critic model for WGAN-GP
-    """
-
-    def __init__(self, batch_size=8, img_size=256):
-        super().__init__()
-        self.batch_size = batch_size
-        self.ratio = img_size / 256.  # Store ratio as an instance variable
-
-        # 定义层
-        self.conv_in = nn.Sequential(
-            Disconv(3, 8, bn=False, act=True),  # WGAN 通常避免输入层的 BN
-            RepViTBlock(8, 16, 3, 2)
+        # 简化后的判别器层
+        # 调整 kernel_size 和 stride
+        self.conv1 = Disconv(3, 8 * self.depth, 4, 2, 1)
+        self.conv2 = self._make_sequential(
+            8 * self.depth, 16 * self.depth)  # 简化 _make_sequential
+        self.conv3 = self._make_sequential(16 * self.depth, 32 * self.depth)
+        self.conv4 = nn.Sequential(  # 进一步简化 conv4 和 conv5 部分
+            Disconv(32 * self.depth, 64 * self.depth, 4, 2, 1),
+            Disconv(64 * self.depth, 64 * self.depth, 4, 2, 1),
         )
-        self.conv1 = self._make_sequential(16, 32, 3)
-        self.conv_out = Disconv(4, 1, bn=False, act=False)  # 输出实数值，无激活
 
-        # 初始化权重
-        self.apply(self.init_weights)
+        # 最终判别层
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64 * self.depth, 1)
+        self.sigmoid = nn.Identity()  # 使用 Identity，配合 BCEWithLogitsLoss
 
-    def _make_sequential(self, in_channels, out_channels, weight):
+    def _make_sequential(self, in_channels, out_channels):  # 简化 _make_sequential
         """
-        Creates a sequential block for the discriminator.
+        创建更基础的卷积序列模块。
         """
         return nn.Sequential(
-            RepViTBlock(in_channels, out_channels, weight, 2),
-            Disconv(out_channels, out_channels * 2),
-            RepViTBlock(out_channels * 2, in_channels, weight, 2),
-            Disconv(in_channels, in_channels // 2),
-            RepViTBlock(in_channels // 2, in_channels // 4, weight, 2),
-            Disconv(in_channels // 4, 4)
+            # 调整 kernel_size 和 stride
+            Disconv(in_channels, out_channels, 4, 2, 1),
+            Disconv(out_channels, out_channels, 1, 1, 1),
         )
 
-    def init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
     def forward(self, x):
-        x = self.conv_in(x)
-        x = self.conv1(x)
-        x = self.conv_out(x)
-        # 调整输出形状
-        batch_size = x.shape[0] if x.shape[0] != self.batch_size else self.batch_size
-        x = x.view(batch_size, -1)
-        return x.mean(dim=1, keepdim=True)  # 输出实数值
+        # 判别器前向传播
+        x = self.conv1(x)   # [B, 8*d, 128, 128]
+        x = self.conv2(x)   # [B, 16*d, 64, 64]
+        x = self.conv3(x)   # [B, 32*d, 32, 32]
+        x = self.conv4(x)   # [B, 64*d, 8, 8]  (简化后下采样更快)
+        x = self.avgpool(x)  # [B, 64*d, 1, 1]
+        x = torch.flatten(x, 1)
+        x = self.fc(x)      # [B, 1]
+        x = self.sigmoid(x)
+        return x
 
 
 # 提取图像块的工具类
@@ -313,20 +273,29 @@ class SWTformerGenerator(nn.Module):
         self.patch_size = patch_size
         self.img_size = (256, 256)  # 固定输入尺寸为 256x256
 
-        # 编码器 (CNN)
-        self.conv1 = nn.Conv2d(3, int(math.ceil(8 * depth)),
-                               kernel_size=3, stride=1, padding=1)
-        self.conv2 = self._make_cnn_block(
-            int(math.ceil(8 * depth)), int(math.ceil(16 * depth)))
-        self.conv3 = self._make_cnn_block(
-            int(math.ceil(16 * depth)), int(math.ceil(32 * depth)))
-        self.conv4 = self._make_cnn_block(
-            int(math.ceil(32 * depth)), int(math.ceil(64 * depth)))
+        # ----------------------- 编码器 -----------------------
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, int(math.ceil(8 * depth)),
+                      kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(int(math.ceil(8 * depth))),
+            nn.SiLU(),
+            PSA(int(math.ceil(8 * depth)), int(math.ceil(8 * depth)))  # 增加PSA
+        )  # 256x256
 
-        # 块嵌入
+        self.conv2 = self._make_cnn_block(
+            int(math.ceil(8 * depth)), int(math.ceil(16 * depth)))  # 128x128
+        self.conv3 = self._make_cnn_block(
+            int(math.ceil(16 * depth)), int(math.ceil(32 * depth)))  # 64x64
+        self.conv4 = self._make_cnn_block(
+            int(math.ceil(32 * depth)), int(math.ceil(64 * depth)))  # 32x32
+
+        # 全局平均池化
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # ----------------------- Transformer -----------------------
         dim = int(math.ceil(64 * depth))
-        self.patch_embed = nn.Linear(patch_size * patch_size * dim, dim)
-        # 固定输入 256x256，编码器缩小 8 倍，特征图为 32x32
+        self.patch_embed = nn.Linear(
+            patch_size * patch_size * dim + dim, dim)  # 融合全局信息
         self.feat_h = 256 // 8  # 32
         self.feat_w = 256 // 8  # 32
         self.num_patches = (self.feat_h // patch_size) *\
@@ -334,53 +303,51 @@ class SWTformerGenerator(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(
             1, self.num_patches, dim))  # [1, 4, dim]
 
-        # Transformer 部分 (ViT 风格)
         self.transformer = nn.ModuleList([
             ViTHybridBlock(dim, num_heads, dim // num_heads,
                            height_top_k, width_top_k, ff_mult=4, dropout=0.1)
             for _ in range(2)  # 两层 Transformer
         ])
 
-        # 解码器 (CNN)
-        self.conv6 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.conv7 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.conv8 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.conv9 = nn.Conv2d(dim, 3, kernel_size=3, padding=1)
+        # ----------------------- 解码器 -----------------------
+        self.upconv6 = Disconv(
+            dim, int(math.ceil(32 * depth)))  # 32x32 -> 64x64
+        self.upconv7 = Disconv(int(math.ceil(32 * depth)),
+                               int(math.ceil(16 * depth)))  # 64x64 -> 128x128
+        self.upconv8 = Disconv(int(math.ceil(16 * depth)),
+                               int(math.ceil(8*depth)))  # 128x128 -> 256x256
+        self.conv9 = nn.Conv2d(int(math.ceil(8*depth)),
+                               3, kernel_size=3, padding=1)  # 最后一层卷积
+
         self.sigmoid = nn.Sigmoid()  # 输出映射到 (0, 1)
 
-        # 投影层用于残差连接
-        self.proj2 = nn.Conv2d(int(math.ceil(
-            8 * depth)), int(math.ceil(16 * depth)), kernel_size=1, stride=2, padding=0)
-        self.proj3 = nn.Conv2d(int(math.ceil(
-            16 * depth)), int(math.ceil(32 * depth)), kernel_size=1, stride=2, padding=0)
-        self.proj4 = nn.Conv2d(int(math.ceil(
-            32 * depth)), int(math.ceil(64 * depth)), kernel_size=1, stride=2, padding=0)
+        # 跳跃连接的 1x1 卷积
+        self.skip_proj2 = nn.Conv2d(
+            int(math.ceil(8 * depth)), int(math.ceil(8 * depth)), kernel_size=1, padding=0)
+        self.skip_proj3 = nn.Conv2d(
+            int(math.ceil(16 * depth)), int(math.ceil(16 * depth)), kernel_size=1, padding=0)
+        self.skip_proj4 = nn.Conv2d(
+            int(math.ceil(32 * depth)), int(math.ceil(32 * depth)), kernel_size=1, padding=0)
 
-        # 初始化权重
-        self.apply(self.init_weights)
+        # 初始化尺寸调整
+        self.adjust6 = nn.Conv2d(
+            dim // 2, int(math.ceil(32*depth)), kernel_size=1, padding=0)
+        self.adjust7 = nn.Conv2d(
+            int(math.ceil(16*depth)), int(math.ceil(16*depth)), kernel_size=1, padding=0)
+        self.adjust8 = nn.Conv2d(
+            int(math.ceil(8*depth)), int(math.ceil(8*depth)), kernel_size=1, padding=0)
 
     def _make_cnn_block(self, in_channels, out_channels):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels,
                       kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.SiLU()
+            nn.SiLU(),
+            PSA(out_channels, out_channels)  # 增加PSA
         )
 
     def init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
+        if isinstance(m, (nn.Conv2d, nn.Linear, nn.ConvTranspose2d)):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -390,36 +357,50 @@ class SWTformerGenerator(nn.Module):
         assert x.shape[2:] == torch.Size(
             [256, 256]), "输入尺寸必须为 [B, 3, 256, 256]"
 
-        # 编码器
-        x1 = self.conv1(x)
-        x2 = self.conv2(x1) + 0.1 * self.proj2(x1)
-        x3 = self.conv3(x2) + 0.1 * self.proj3(x2)
-        x4 = self.conv4(x3) + 0.1 * self.proj4(x3)
+        # ----------------------- 编码器 -----------------------
+        x1 = self.conv1(x)  # 256x256 -> 256x256
+        x2 = self.conv2(x1)  # 256x256 -> 128x128
+        x3 = self.conv3(x2)  # 128x128 -> 64x64
+        x4 = self.conv4(x3)  # 64x64 -> 32x32
 
-        # 块嵌入与 Transformer
-        patches = Patches(self.patch_size)(x4)
-        x5 = self.patch_embed(patches) + self.pos_embed
+        # 全局平均池化
+        global_feat = self.global_pool(x4)
+        global_feat = torch.flatten(global_feat, 1)  # [B, dim]
+
+        # ----------------------- Transformer -----------------------
+        patches = Patches(self.patch_size)(x4)  # 使用 Patches 提取图像块
+        x5 = torch.cat([patches, global_feat[:, None, :].expand(-1,
+                       patches.shape[1], -1)], dim=-1)  # 融合全局信息
+        x5 = self.patch_embed(x5) + self.pos_embed  # 融合位置编码
         for block in self.transformer:
             x5 = block(x5)
 
-        # 重塑回图像格式，使用编码器输出尺寸
+        # 重塑回图像格式
         B, N, C = x5.shape
         x5 = x5.view(B, self.feat_h // self.patch_size,
                      self.feat_w // self.patch_size, C).permute(0, 3, 1, 2)
 
-        # 解码器
-        x6 = self.conv6(x5)  # 2x2 -> 4x4
-        x7_temp = self.conv7(x6)  # 4x4 -> 8x8
-        x7 = x7_temp + 0.1 *\
-            F.interpolate(
-                x6, size=x7_temp.shape[2:], mode='bilinear', align_corners=True)
-        x8_temp = self.conv8(x7)  # 8x8 -> 16x16
-        x8 = x8_temp + 0.1 *\
-            F.interpolate(
-                x7, size=x8_temp.shape[2:], mode='bilinear', align_corners=True)
-        # 最终调整到 256x256
-        x9 = F.interpolate(x8, size=self.img_size,
-                           mode='bilinear', align_corners=True)
-        x9 = self.sigmoid(self.conv9(x9))
+        # ----------------------- 解码器 -----------------------
+        skip2 = self.skip_proj2(x1)  # 256x256 -> 256x256
+        skip3 = self.skip_proj3(x2)  # 128x128 -> 128x128
+        skip4 = self.skip_proj4(x3)  # 64x64 -> 64x64
+
+        x6 = self.upconv6(x5)  # 32x32 -> 64x64
+        x6 = F.interpolate(
+            x6, size=skip4.shape[2:], mode='bilinear', align_corners=True)  # 插值到对应的大小
+        x6 = self.adjust6(x6) + skip4  # 添加skip链接
+
+        x7 = self.upconv7(x6)  # 64x64 -> 128x128
+        x7 = F.interpolate(
+            x7, size=skip3.shape[2:], mode='bilinear', align_corners=True)  # 插值到对应的大小
+        x7 = self.adjust7(x7) + skip3
+
+        x8 = self.upconv8(x7)  # 128x128 -> 256x256
+        x8 = F.interpolate(
+            x8, size=skip2.shape[2:], mode='bilinear', align_corners=True)
+        x8 = self.adjust8(x8) + skip2
+
+        x9 = self.conv9(x8)  # 调整到 256x256
+        x9 = self.sigmoid(x9)
 
         return x9

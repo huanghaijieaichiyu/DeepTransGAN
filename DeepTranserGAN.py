@@ -33,15 +33,14 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import Generator, Discriminator, Critic, SWTformerGenerator
+from models.base_mode import Generator, Discriminator, SWTformerGenerator
 from utils.loss import BCEBlurWithLogitsLoss
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
-from torch.backends.cuda import sdp_kernel
 
 
 class BaseTrainer:
     def __init__(self, args, generator, discriminator=None, critic=None):
-        self.n_pretain = 5
+        self.n_pretain = 10
         self.args = args
         self.generator = generator
         self.discriminator = discriminator
@@ -281,9 +280,9 @@ class StandardGANTrainer(BaseTrainer):
                     fake, high_images)  # 增加像素损失，提高生成图像质量
                 g_output.backward()
                 d_g_z2 = fake_inputs.mean().item()
-                torch.nn.utils.clip_grad_norm_(
+                '''torch.nn.utils.clip_grad_norm_(
                     self.discriminator.parameters(), 100)
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5)'''
 
                 self.g_optimizer.step()
 
@@ -296,9 +295,9 @@ class StandardGANTrainer(BaseTrainer):
                                      % (self.epoch + 1, self.args.epochs, i + 1, len(self.train_loader),
                                         d_output, g_output.item(), d_x, d_g_z1, d_g_z2))
                 self.save_checkpoint()
-                '''# 学习率调整
+                # 学习率调整
                 self.scheduler_g.step()
-                self.scheduler_d.step()'''
+                self.scheduler_d.step()
         self.write_log(self.epoch, gen_loss, dis_loss, d_x, d_g_z1, d_g_z2)
         high_images = high_images.to(self.device)
         fake = fake.to(self.device)
@@ -370,7 +369,7 @@ class WGAN_GPTrainer(BaseTrainer):
 
 
 def train(args):
-    generator = SWTformerGenerator()
+    generator = Generator()
     discriminator = Discriminator()
     model_structure(generator, (3, 256, 256))
     model_structure(discriminator, (3, 256, 256))
@@ -380,7 +379,7 @@ def train(args):
 
 def train_WGAN(args):
     generator = Generator()
-    critic = Critic()
+    critic = Discriminator()
     model_structure(generator, (3, 256, 256))
     model_structure(critic, (3, 256, 256))
     trainer = WGAN_GPTrainer(args, generator, critic)
