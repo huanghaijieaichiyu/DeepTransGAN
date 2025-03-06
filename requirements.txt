@@ -1,13 +1,16 @@
-torch
-opencv-python<=4.9.0.80
-imageio<=2.14.0
-numpy<=1.26.3
-timm<=0.9.16
-torchvision
-tqdm<=4.65.0
-ptflops<= 0.7.2.2
-torcheval<=0.70
-rich~=13.7.1
+torch>=1.10.0
+torchvision>=0.11.0
+numpy>=1.20.0
+opencv-python>=4.5.0
+tqdm>=4.60.0
+ptflops>=0.6.9
+torcheval>=0.0.6
+tensorboard>=2.8.0
+imageio>=2.15.0
+Pillow>=8.0.0
+matplotlib>=3.4.0
+scikit-image>=0.18.0
+timm>=0.5.0
 # 测试用
 cython
 

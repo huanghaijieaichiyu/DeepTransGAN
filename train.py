@@ -11,7 +11,7 @@ def args():
                         help="number of epochs of training")  # 减少epochs但提高训练效率
     parser.add_argument("--batch_size", type=int, default=16,
                         help="size of the batches")  # 降低batch_size以适应复杂模型
-    parser.add_argument("--optimizer", type=str, default='AdamW',
+    parser.add_argument("--optimizer", type=str, default='Adam',
                         choices=['AdamW', 'SGD', 'Adam', 'lion', 'rmp'])
     parser.add_argument("--num_workers", type=int, default=4,
                         help="number of data loading workers, if in windows, must be 0"
@@ -27,7 +27,7 @@ def args():
     parser.add_argument("--loss", type=str, default='BCEBlurWithLogitsLoss',
                         choices=['BCEBlurWithLogitsLoss', 'mse', 'bce',
                                  'FocalLoss'], help="loss function")
-    parser.add_argument("--lr", type=float, default=2e-4,
+    parser.add_argument("--lr", type=float, default=5e-4,
                         help="learning rate")
     parser.add_argument("--momentum", type=float, default=0.9,
                         help="momentum for adam and SGD")

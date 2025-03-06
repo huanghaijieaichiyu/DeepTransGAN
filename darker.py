@@ -28,13 +28,10 @@ class Darker:
         """
         对传入的图像执行暗化处理
         """
-        seed = random.uniform(0, 1)
+        seed = random.uniform(0.5, 1)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        hsv[:, :, 2] = np.clip(hsv[:, :, 2].astype(np.float32) * ratio, 0, 255)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1].astype(
-            np.float32) * seed, 0, 255)
-        hsv[:, :, 0] = np.clip(hsv[:, :, 0].astype(
-            np.float32) * 0.5 * seed, 0, 255)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2].astype(
+            np.float32) * ratio * seed, 0, 255)
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     def process_images(self):
