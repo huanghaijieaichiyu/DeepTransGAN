@@ -1396,6 +1396,23 @@ class Gencov(nn.Module):
         self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
         self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
+        # 初始化权重，使用kaiming初始化
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # 使用kaiming_normal_初始化卷积权重
+        nn.init.kaiming_normal_(
+            self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
+        if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
+
+        # 如果使用InstanceNorm，初始化其参数
+        if isinstance(self.bn, nn.InstanceNorm2d):
+            if self.bn.weight is not None:
+                nn.init.constant_(self.bn.weight, 1.0)
+            if self.bn.bias is not None:
+                nn.init.constant_(self.bn.bias, 0.0)
+
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
 

@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
+import torch.optim.rmsprop
 from torch.utils import tensorboard
 from torch.utils.data import DataLoader
 from torcheval.metrics.functional import peak_signal_noise_ratio
@@ -30,7 +31,7 @@ from torchvision import transforms
 from tqdm import tqdm  # 更新导入以使用新的autocast API
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import Generator, Discriminator, SWTformerGenerator
+from models.base_mode import AdvancedGenerator, Generator, Discriminator
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
 
 
@@ -187,9 +188,10 @@ class BaseTrainer:
                                       shuffle=False, drop_last=False, pin_memory=True)
 
         # 优化器初始化 - 使用不同的学习率
-        self.g_optimizer, self.d_optimizer = get_opt(
+        self.g_optimizer, _ = get_opt(
             args, self.generator, self.discriminator)
-
+        self.d_optimizer = torch.optim.RMSprop(
+            self.discriminator.parameters(), lr=args.lr)
         # 损失函数组合
         self.g_loss = get_loss(args.loss).to(
             self.device) if args.loss else nn.MSELoss().to(self.device)
@@ -630,9 +632,9 @@ class BaseTrainer:
             self.scheduler_g.step()
             if self.scheduler_d is not None:
                 self.scheduler_d.step()
-
             # 定期评估模型
-            if (self.epoch + 1) % self.eval_interval == 0:
+            if ((self.epoch + 1) % self.eval_interval == 0) and \
+                    ((self.epoch + 1) >= self.eval_interval):
                 stop_training = self.evaluate_model()
 
             # 保存最新检查点
@@ -1246,7 +1248,7 @@ class WGAN_GPTrainer(BaseTrainer):
 
 
 def train(args):
-    generator = Generator()
+    generator = AdvancedGenerator()
     discriminator = Discriminator()
     model_structure(generator, (3, 256, 256))
     model_structure(discriminator, (3, 256, 256))

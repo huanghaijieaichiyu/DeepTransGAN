@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from models.Repvit import RepViTBlock
-from models.common import SPPELAN, Concat, Disconv, Gencov, PSA
+from models.common import EMA, SPPELAN, C2f, C2fCIB, Concat, Disconv, Gencov, PSA, Conv, CBAM, ADown, DilateBlock
 
 
 class BaseNetwork(nn.Module):
@@ -101,6 +101,111 @@ class Generator(BaseNetwork):
         return x9
 
 
+class AdvancedGenerator(BaseNetwork):
+    """
+    An advanced generator network with dilated attention and multi-scale feature fusion.
+    Input: [B, 3, 256, 256]
+    Output: [B, 3, 256, 256]
+    """
+
+    def __init__(self, depth=1):
+        super().__init__()
+        self.depth = depth
+        base_ch = 32  # Base number of channels
+
+        # Initial feature extraction
+        self.conv1 = nn.Sequential(
+            Gencov(3, base_ch, k=7),
+            # Use standard Conv from common.py
+        )
+
+        # Encoder blocks with dilated attention
+        self.enc2 = self._make_encoder_block(base_ch, base_ch * 2)
+        self.enc3 = self._make_encoder_block(base_ch * 2, base_ch * 4)
+        self.enc4 = self._make_encoder_block(base_ch * 4, base_ch * 8)
+
+        # Multi-scale feature processing
+        self.msf = nn.ModuleList([
+            SPPELAN(base_ch * 8, base_ch * 8, base_ch * 4)
+        ])
+
+        # PSA attention for feature enhancement
+        self.psa = PSA(base_ch * 8, base_ch * 8)
+
+        # Decoder blocks with advanced upsampling
+        self.dec3 = self._make_decoder_block(
+            base_ch * 16, base_ch * 4)  # Doubled input channels for skip
+        self.dec2 = self._make_decoder_block(
+            base_ch * 8, base_ch * 2)   # Doubled input channels for skip
+        self.dec1 = self._make_decoder_block(base_ch * 4, base_ch)
+
+        # Final refinement
+        self.refine = nn.Sequential(
+            Gencov(base_ch * 2, base_ch, k=3),
+            Gencov(base_ch, 3, k=7, bn=False, act=False),
+            nn.Sigmoid()
+        )
+
+    def _make_encoder_block(self, in_ch, out_ch):
+        """Enhanced encoder block with dilated convolutions and attention"""
+        return nn.Sequential(
+            Gencov(in_ch, out_ch * 2, k=3, s=2),
+            C2f(out_ch * 2, out_ch)  # Channel reduction
+        )
+
+    def _make_decoder_block(self, in_ch, out_ch):
+        """Enhanced decoder block with attention and residual connection"""
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            C2fCIB(in_ch, out_ch)
+        )
+
+    def _init_weights(self, m):
+        """Initialize weights for Conv2d, Linear, and BatchNorm2d layers"""
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='relu')
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.ones_(m.weight)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        # Input validation
+        assert x.shape[2:] == torch.Size(
+            [256, 256]), "Input size must be [B, 3, 256, 256]"
+
+        # Initial feature extraction
+        x1 = self.conv1(x)      # [B, 32, 256, 256]
+
+        # Encoder path with progressive feature learning
+        x2 = self.enc2(x1)     # [B, 64, 128, 128]
+        x3 = self.enc3(x2)     # [B, 128, 64, 64]
+        x4 = self.enc4(x3)     # [B, 256, 32, 32]
+
+        # Multi-scale feature processing
+        feat = x4
+        for msf_block in self.msf:
+            feat = msf_block(feat)
+
+        # Feature enhancement with PSA
+        feat = self.psa(feat)
+
+        # Decoder path with skip connections and feature fusion
+        d3 = self.dec3(torch.cat([feat, x4], 1))   # [B, 128, 64, 64]
+        d2 = self.dec2(torch.cat([d3, x3], 1))     # [B, 64, 128, 128]
+        d1 = self.dec1(torch.cat([d2, x2], 1))     # [B, 32, 256, 256]
+
+        # Final refinement with original features
+        out = self.refine(torch.cat([d1, x1], 1))  # [B, 3, 256, 256]
+
+        return out
+
+
 class Discriminator(BaseNetwork):
     """
     Discriminator model with no activation function
@@ -148,301 +253,3 @@ class Discriminator(BaseNetwork):
         x = self.fc(x)      # [B, 1]
         x = self.sigmoid(x)
         return x
-
-
-class DualPrunedSelfAttn(nn.Module):
-    def __init__(self, dim, dim_head, heads, height_top_k, width_top_k, dropout=0.):
-        super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head
-        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.to_out = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.height_top_k = height_top_k
-        self.width_top_k = width_top_k
-
-    def forward(self, x):
-        B, N, C = x.size()
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(B, N, self.heads,
-                      self.dim_head).transpose(1, 2), qkv)
-        attn = torch.einsum('b h i d, b h j d -> b h i j',
-                            q, k) * (self.dim_head ** -0.5)
-        attn = self.prune_attn(attn, self.height_top_k, self.width_top_k)
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, N, C)
-        out = self.to_out(out)
-        return out
-
-    def prune_attn(self, attn, height_top_k, width_top_k):
-        B, H, N, _ = attn.shape
-        device = attn.device
-        row_scores = attn.mean(dim=-1)
-        _, top_row_idx = row_scores.topk(height_top_k, dim=-1)
-        row_mask = torch.zeros(B, H, N, device=device)
-        row_mask.scatter_(-1, top_row_idx, 1)
-        row_mask = row_mask.unsqueeze(-1).expand(B, H, N, N)
-        col_scores = attn.mean(dim=-2)
-        _, top_col_idx = col_scores.topk(width_top_k, dim=-1)
-        col_mask = torch.zeros(B, H, N, device=device)
-        col_mask.scatter_(-1, top_col_idx, 1)
-        col_mask = col_mask.unsqueeze(-2).expand(B, H, N, N)
-        mask = row_mask * col_mask
-        return attn * mask
-
-# 改进的Hybrid Perception Block，添加了更多注意力机制和更好的残差连接
-
-
-class EnhancedHybridPerceptionBlock(nn.Module):
-    def __init__(self, dim, dim_head, heads, attn_height_top_k,
-                 attn_width_top_k, attn_dropout, ff_mult, ff_dropout):
-        super().__init__()
-        # 第一个标准化和注意力块
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = DualPrunedSelfAttn(
-            dim, dim_head, heads, attn_height_top_k,
-            attn_width_top_k, dropout=attn_dropout)
-
-        # 第二个标准化和前馈网络
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        # 使用两层感知机代替ModuleList以提高性能
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * ff_mult),
-            nn.GELU(),
-            nn.Dropout(ff_dropout),
-            nn.Linear(dim * ff_mult, dim),
-        )
-
-        # 深度可分离卷积捕获局部信息
-        self.dw_conv = nn.Conv2d(
-            dim, dim, kernel_size=3, padding=1, groups=dim)
-        self.pw_conv = nn.Conv2d(dim, dim, kernel_size=1)
-
-        # 添加空间注意力和通道注意力
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(dim, dim // 8, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(dim // 8, 1, kernel_size=7, padding=3),
-            nn.Sigmoid()
-        )
-
-        self.channel_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, dim // 8, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(dim // 8, dim, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-        # 伽马参数用于控制残差连接的强度
-        self.gamma1 = nn.Parameter(torch.ones(1) * 0.5)
-        self.gamma2 = nn.Parameter(torch.ones(1) * 0.5)
-
-    def forward(self, x):
-        # 保存输入用于残差连接
-        input_x = x
-
-        # 处理自注意力部分
-        B, C, H, W = x.size()
-        x_attn = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
-        x_attn = self.norm1(x_attn)
-        x_attn = self.attn(x_attn)
-        x_attn = x_attn.view(B, H, W, C).permute(0, 3, 1, 2)
-
-        # 卷积分支处理
-        x_conv = self.dw_conv(x)
-        x_conv = self.pw_conv(x_conv)
-
-        # 融合自注意力和卷积分支
-        x = x_attn + x_conv
-
-        # 应用空间和通道注意力机制
-        spatial_weight = self.spatial_gate(x)
-        channel_weight = self.channel_gate(x)
-        x = x * spatial_weight * channel_weight
-
-        # 第一个残差连接
-        x = input_x + self.gamma1 * x
-
-        # 前馈网络处理
-        identity = x
-        normed = self.norm2(x.permute(0, 2, 3, 1))
-        normed = normed.contiguous().view(B * H * W, C)
-        ff_out = self.ff(normed)
-        ff_out = ff_out.view(B, H, W, C).permute(0, 3, 1, 2)
-
-        # 第二个残差连接
-        x = identity + self.gamma2 * ff_out
-
-        return x
-
-# 改进的SWTformerGenerator网络
-
-
-class SWTformerGenerator(nn.Module):
-    def __init__(self, depth=1, weight=1):
-        super().__init__()
-        self.depth = depth
-        self.weight = weight
-
-        # 编码器 - 使用级联卷积结构
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, int(math.ceil(8 * self.depth)),
-                      kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
-            nn.BatchNorm2d(int(math.ceil(8 * self.depth)))
-        )
-
-        # 使用更高效的下采样块
-        self.conv2 = self._make_sequential(
-            int(math.ceil(8 * self.depth)), int(math.ceil(16 * self.depth)))
-        self.conv3 = self._make_sequential(
-            int(math.ceil(16 * self.depth)), int(math.ceil(32 * self.depth)))
-        self.conv4 = self._make_sequential(
-            int(math.ceil(32 * self.depth)), int(math.ceil(64 * self.depth)))
-
-        # 特征融合层
-        dim = int(math.ceil(64 * self.depth))
-        # 增加一个瓶颈层进行特征压缩，不增加计算量
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(dim // 2, dim, kernel_size=1)
-        )
-
-        # Transformer部分 - 使用增强的HybridPerceptionBlock
-        dim_head = dim // 8
-        self.hpb1 = EnhancedHybridPerceptionBlock(
-            dim, dim_head, heads=8,
-            attn_height_top_k=64, attn_width_top_k=64,
-            attn_dropout=0.1, ff_mult=2, ff_dropout=0.1
-        )
-        self.hpb2 = EnhancedHybridPerceptionBlock(
-            dim, dim_head, heads=8,
-            attn_height_top_k=64, attn_width_top_k=64,
-            attn_dropout=0.1, ff_mult=2, ff_dropout=0.1
-        )
-
-        # 解码器 - 改进的上采样块
-        self.up1 = self._make_up_block(dim, dim)
-        self.up2 = self._make_up_block(dim, dim)
-        self.up3 = self._make_up_block(dim, dim)
-
-        # 细化网络 - 最终输出层
-        self.refine = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(dim // 2, 3, kernel_size=3, padding=1),
-            nn.Sigmoid()  # 确保输出在(0,1)范围内
-        )
-
-        # 跳跃连接投影层
-        self.proj2 = nn.Conv2d(
-            int(math.ceil(8 * self.depth)),
-            int(math.ceil(16 * self.depth)),
-            kernel_size=1, stride=2, padding=0
-        )
-        self.proj3 = nn.Conv2d(
-            int(math.ceil(16 * self.depth)),
-            int(math.ceil(32 * self.depth)),
-            kernel_size=1, stride=2, padding=0
-        )
-        self.proj4 = nn.Conv2d(
-            int(math.ceil(32 * self.depth)),
-            int(math.ceil(64 * self.depth)),
-            kernel_size=1, stride=2, padding=0
-        )
-
-        # 添加跳跃连接通道调整层 - 用于解决通道不匹配问题
-        self.skip_proj2 = nn.Conv2d(
-            int(math.ceil(16 * self.depth)),
-            dim,  # 将编码器特征映射到相同的通道数
-            kernel_size=1, padding=0
-        )
-        self.skip_proj3 = nn.Conv2d(
-            int(math.ceil(32 * self.depth)),
-            dim,  # 将编码器特征映射到相同的通道数
-            kernel_size=1, padding=0
-        )
-
-        # 初始化权重
-        self.apply(self._init_weights)
-
-    def _make_sequential(self, in_channels, out_channels):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels,
-                      kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU(),
-            nn.Conv2d(out_channels, out_channels,
-                      kernel_size=3, padding=1, groups=1),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU()
-        )
-
-    def _make_up_block(self, in_channels, out_channels):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU()
-        )
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.kaiming_normal_(
-                m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        # 编码器前向传播
-        x1 = self.conv1(x)
-        x2 = self.conv2(x1)
-        x2 = x2 + self.proj2(x1)  # 添加残差缩放
-
-        x3 = self.conv3(x2)
-        x3 = x3 + self.proj3(x2)
-
-        x4 = self.conv4(x3)
-        x4 = x4 + self.proj4(x3)
-
-        # 瓶颈层特征处理
-        x4 = self.bottleneck(x4) + x4  # 残差连接
-
-        # Transformer处理
-        x5 = self.hpb1(x4)
-        x5 = self.hpb2(x5)
-
-        # 解码器前向传播 - 使用跳跃连接
-        x6 = self.up1(x5)
-
-        # 添加跳跃连接，使用插值调整尺寸并确保通道匹配
-        x7 = self.up2(x6)
-        size7 = (x7.shape[2], x7.shape[3])
-        # 使用通道投影层解决通道不匹配问题
-        skip_x3 = F.interpolate(
-            self.skip_proj3(x3), size=size7, mode='bilinear', align_corners=True
-        )
-        x7 = x7 + self.res_scale * skip_x3
-
-        x8 = self.up3(x7)
-        size8 = (x8.shape[2], x8.shape[3])
-        # 使用通道投影层解决通道不匹配问题
-        skip_x2 = F.interpolate(
-            self.skip_proj2(x2), size=size8, mode='bilinear', align_corners=True
-        )
-        x8 = x8 + self.res_scale * skip_x2
-
-        # 最终输出
-        out = self.refine(x8)
-
-        return out
