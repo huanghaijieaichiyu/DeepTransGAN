@@ -19,23 +19,18 @@ code by 黄小海  2025/2/19
 import os
 import time
 import cv2
-import imageio
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
-from torch.optim.lr_scheduler import StepLR
 from torch.utils import tensorboard
 from torch.utils.data import DataLoader
 from torcheval.metrics.functional import peak_signal_noise_ratio
 from torchvision import transforms
-from tqdm import tqdm
-import torch.amp as amp  # 更新导入以使用新的autocast API
+from tqdm import tqdm  # 更新导入以使用新的autocast API
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import Generator, Discriminator, LightSWTformer
-from utils.loss import BCEBlurWithLogitsLoss
+from models.base_mode import Generator, Discriminator, SWTformerGenerator
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
 
 
@@ -82,6 +77,52 @@ class SpectralNormConv2d(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+# 添加自定义的Warmup余弦退火学习率调度器
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6, warmup_start_lr=1e-7):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.warmup_start_lr = warmup_start_lr
+        self.base_lr = optimizer.param_groups[0]['lr']
+        self.current_epoch = 0
+
+    def step(self):
+        self.current_epoch += 1
+        if self.current_epoch <= self.warmup_epochs:
+            # Warmup阶段：线性增加学习率
+            lr = self.warmup_start_lr + (self.base_lr - self.warmup_start_lr) * \
+                (self.current_epoch / self.warmup_epochs)
+        else:
+            # 余弦退火阶段
+            progress = (self.current_epoch - self.warmup_epochs) / \
+                (self.total_epochs - self.warmup_epochs)
+            lr = self.min_lr + (self.base_lr - self.min_lr) * \
+                0.5 * (1 + np.cos(np.pi * progress))
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def state_dict(self):
+        return {
+            'current_epoch': self.current_epoch,
+            'base_lr': self.base_lr,
+            'warmup_epochs': self.warmup_epochs,
+            'total_epochs': self.total_epochs,
+            'min_lr': self.min_lr,
+            'warmup_start_lr': self.warmup_start_lr
+        }
+
+    def load_state_dict(self, state_dict):
+        self.current_epoch = state_dict['current_epoch']
+        self.base_lr = state_dict['base_lr']
+        self.warmup_epochs = state_dict['warmup_epochs']
+        self.total_epochs = state_dict['total_epochs']
+        self.min_lr = state_dict['min_lr']
+        self.warmup_start_lr = state_dict['warmup_start_lr']
 
 
 class BaseTrainer:
@@ -146,12 +187,13 @@ class BaseTrainer:
                                       shuffle=False, drop_last=False, pin_memory=True)
 
         # 优化器初始化 - 使用不同的学习率
-        self.g_optimizer, self.d_optimizer = self._get_optimizers(args)
+        self.g_optimizer, self.d_optimizer = get_opt(
+            args, self.generator, self.discriminator)
 
         # 损失函数组合
         self.g_loss = get_loss(args.loss).to(
             self.device) if args.loss else nn.MSELoss().to(self.device)
-        self.stable_loss = nn.SmoothL1Loss().to(self.device)
+        self.stable_loss = nn.MSELoss().to(self.device)
 
         # 路径设置
         self.path = save_path(
@@ -166,12 +208,23 @@ class BaseTrainer:
         self.patience_counter = 0
         self.eval_interval = 5  # 每5个epoch评估一次
 
-        # 学习率调度 - 使用余弦退火
-        self.scheduler_g = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.g_optimizer, T_0=10, T_mult=2, eta_min=args.lr * 0.001)
+        # 学习率调度 - 使用Warmup和余弦退火
+        warmup_epochs = int(args.epochs * 0.1)  # 使用总epochs的10%作为warmup
+        self.scheduler_g = WarmupCosineScheduler(
+            optimizer=self.g_optimizer,
+            warmup_epochs=warmup_epochs,
+            total_epochs=args.epochs,
+            min_lr=args.lr * 0.001,
+            warmup_start_lr=args.lr * 0.0001
+        )
         if self.d_optimizer is not None:
-            self.scheduler_d = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.d_optimizer, T_0=10, T_mult=2, eta_min=args.lr * 0.001)
+            self.scheduler_d = WarmupCosineScheduler(
+                optimizer=self.d_optimizer,
+                warmup_epochs=warmup_epochs,
+                total_epochs=args.epochs,
+                min_lr=args.lr * 0.001,
+                warmup_start_lr=args.lr * 0.0001
+            )
         else:
             self.scheduler_d = None
 
@@ -195,10 +248,6 @@ class BaseTrainer:
         self.nan_detected = False
         self.nan_count = 0
         self.max_nan_count = 5  # 连续NaN次数阈值
-
-        # 感知损失权重
-        self.perceptual_weight = 0.5  # 增加感知损失权重
-
         # 确保路径存在
         if self.args.resume == '':
             os.makedirs(os.path.join(self.path, 'generator'), exist_ok=True)
@@ -257,8 +306,17 @@ class BaseTrainer:
             g_path_checkpoint = os.path.join(
                 self.args.resume, 'generator/last.pt')
             if os.path.exists(g_path_checkpoint):
-                g_checkpoint = torch.load(
-                    g_path_checkpoint, map_location=self.device)
+                try:
+                    # First try loading with weights_only=True (safer)
+                    g_checkpoint = torch.load(
+                        g_path_checkpoint, map_location=self.device, weights_only=True)
+                except Exception as e:
+                    print(
+                        "Warning: Failed to load with weights_only=True, attempting legacy loading...")
+                    # If that fails, try the legacy loading method
+                    g_checkpoint = torch.load(
+                        g_path_checkpoint, map_location=self.device, weights_only=False)
+
                 self.generator.load_state_dict(g_checkpoint['net'])
                 self.g_optimizer.load_state_dict(g_checkpoint['optimizer'])
                 self.epoch = g_checkpoint['epoch']
@@ -274,10 +332,20 @@ class BaseTrainer:
 
             # 加载判别器或评论器
             d_path_checkpoint = os.path.join(
-                self.args.resume, 'discriminator/last.pt') if self.discriminator else os.path.join(self.args.resume, 'critic/last.pt')
+                self.args.resume, 'discriminator/last.pt') if \
+                self.discriminator else os.path.join(self.args.resume, 'critic/last.pt')
             if os.path.exists(d_path_checkpoint):
-                d_checkpoint = torch.load(
-                    d_path_checkpoint, map_location=self.device)
+                try:
+                    # First try loading with weights_only=True (safer)
+                    d_checkpoint = torch.load(
+                        d_path_checkpoint, map_location=self.device, weights_only=True)
+                except Exception as e:
+                    print(
+                        "Warning: Failed to load with weights_only=True, attempting legacy loading...")
+                    # If that fails, try the legacy loading method
+                    d_checkpoint = torch.load(
+                        d_path_checkpoint, map_location=self.device, weights_only=False)
+
                 if self.discriminator:
                     self.discriminator.load_state_dict(d_checkpoint['net'])
                 elif self.critic:
@@ -581,50 +649,24 @@ class BaseTrainer:
             if isinstance(module, nn.Conv2d):
                 spectral_norm(module)
 
-    def _get_optimizers(self, args):
-        """获取优化器，为生成器和判别器使用不同的学习率"""
-        # 生成器使用较小的学习率
-        g_lr = args.lr * 0.5
-        # 判别器使用较大的学习率 (TTUR)
-        d_lr = args.lr * 2.0
-
-        # 为生成器使用 Adam 优化器，较小的 beta 值
-        g_optimizer = torch.optim.Adam(
-            self.generator.parameters(),
-            lr=g_lr,
-            betas=(0.5, 0.999),
-            weight_decay=args.weight_decay if hasattr(
-                args, 'weight_decay') else 1e-5
-        )
-
-        # 为判别器使用 RMSprop 优化器，更稳定
-        d_optimizer = None
-        if self.discriminator is not None:
-            d_optimizer = torch.optim.RMSprop(
-                self.discriminator.parameters(),
-                lr=d_lr,
-                weight_decay=args.weight_decay if hasattr(
-                    args, 'weight_decay') else 1e-5
-            )
-        elif self.critic is not None:
-            d_optimizer = torch.optim.RMSprop(
-                self.critic.parameters(),
-                lr=d_lr,
-                weight_decay=args.weight_decay if hasattr(
-                    args, 'weight_decay') else 1e-5
-            )
-
-        return g_optimizer, d_optimizer
-
     def add_noise_to_input(self, tensor, noise_factor=None):
-        """向输入添加噪声，提高稳定性"""
+        """添加高斯噪声到输入 - 优化版本"""
         if noise_factor is None:
-            noise_factor = self.noise_factor
+            # 使用默认噪声因子
+            noise_factor = getattr(self.args, 'noise_factor', 0.05)
 
-        if noise_factor > 0:
-            noise = torch.randn_like(tensor) * noise_factor
-            return tensor + noise
-        return tensor
+        # 如果噪声因子为0，直接返回原始张量
+        if noise_factor <= 0:
+            return tensor
+
+        # 批量创建噪声张量以提高效率
+        noise = torch.randn_like(tensor) * noise_factor
+
+        # 添加噪声（保持在合理范围内）
+        noisy_tensor = tensor + noise
+
+        # 确保值在[0,1]范围
+        return torch.clamp(noisy_tensor, 0.0, 1.0)
 
     def _initialize_weights(self, model):
         """初始化模型权重，使用Kaiming初始化"""
@@ -681,9 +723,6 @@ class StandardGANTrainer(BaseTrainer):
         # 使用 BCEWithLogitsLoss 以兼容 autocast
         self.d_loss = nn.BCEWithLogitsLoss().to(self.device)
 
-        # 添加 L1 损失用于像素级监督
-        self.l1_loss = nn.L1Loss().to(self.device)
-
         # 添加梯度缩放因子，防止梯度爆炸
         self.gradient_scale = 0.1
 
@@ -702,7 +741,7 @@ class StandardGANTrainer(BaseTrainer):
         adv_loss = self.d_loss(fake_outputs, torch.ones_like(fake_outputs))
 
         # 像素级损失 - 生成的图像应该与真实图像相似
-        pixel_loss = self.l1_loss(fake_images, real_images)
+        pixel_loss = self.stable_loss(fake_images, real_images)
 
         # 总损失 = 对抗损失 + 加权像素损失
         total_loss = adv_loss + pixel_loss * self.pixel_loss_weight
@@ -802,7 +841,7 @@ class StandardGANTrainer(BaseTrainer):
 
                     d_loss_accumulator += d_output.item()
 
-                # 使用scaler进行反向传播和优化器步进
+                # 反向传播
                 d_output.backward()
                 self.d_optimizer.step()
 
@@ -984,218 +1023,204 @@ class WGAN_GPTrainer(BaseTrainer):
         return total_loss
 
     def train_epoch(self):
-        if self.critic is None:
-            self.log_message(
-                "Critic is not initialized. Cannot train WGAN-GP.")
-            return
+        """训练一个周期 - 优化版本，简化逻辑，提高效率"""
+        # 使用rich进度条显示（如果可用）
+        progress = self.create_rich_progress()
+        task_id = None
 
-        self.critic.train()
-        self.generator.train()
-        source_g = [0.]
-        g_z = 0.
+        # 记录训练损失
         gen_loss = []
         critic_loss = []
+        g_z_value = 0.0
 
-        # 使用 rich 进度条（如果可用）
-        progress = None
-        task_id = None
+        # 设置自动混合精度上下文
+        scaler_g = torch.cuda.amp.GradScaler(enabled=self.args.autocast)
+        scaler_c = torch.cuda.amp.GradScaler(enabled=self.args.autocast)
+
+        # 梯度累积计数器
+        batch_count = 0
+
+        # 预先定义噪声系数以减少计算
+        noise_factor = self.args.noise_factor if hasattr(
+            self.args, 'noise_factor') else 0.05
+
+        # 初始化进度条
         if hasattr(self, 'rich_available') and self.rich_available:
-            progress = self.create_rich_progress()
             if progress is not None:
                 task_id = progress.add_task(
                     f"[cyan]Epoch {self.epoch + 1}/{self.args.epochs}", total=len(self.train_loader))
                 progress.start()
         else:
-            # 美化进度条
             pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                         bar_format='{l_bar}{bar:10}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                         colour='blue', ncols=100)
 
-        # 梯度累积相关变量
-        c_loss_accumulator = 0
-        g_loss_accumulator = 0
-        batch_count = 0
+        # 将模型设置为训练模式
+        self.generator.train()
+        if self.critic is not None:
+            self.critic.train()
 
-        for i, (low_images, high_images) in enumerate(self.train_loader):
+        # 遍历数据批次
+        for i, (high_images, low_images) in enumerate(self.train_loader):
             batch_count += 1
-            low_images = low_images.to(self.device)
+
+            # 将图像移动到设备
             high_images = high_images.to(self.device)
+            low_images = low_images.to(self.device)
 
-            # 检查输入数据是否包含NaN
-            if torch.isnan(low_images).any() or torch.isnan(high_images).any():
-                self.log_message("警告: 输入数据包含NaN值，跳过此批次")
-                continue
+            # ============================
+            # 训练评论器（Critic）
+            # ============================
+            critic_loss_batch = 0
 
-            # 使用混合精度训练 - 使用正确的autocast
-            with autocast(enabled=self.args.autocast):
-                # 训练评论器（Critic）
-                for j in range(self.d_updates_per_g):  # 使用 TTUR
-                    if self.c_optimizer is not None:
-                        self.c_optimizer.zero_grad(set_to_none=True)
-                    else:
-                        continue  # 如果没有评论器优化器，跳过评论器训练
+            # 仅当critic存在且优化器已配置时才训练critic
+            if self.critic is not None and self.c_optimizer is not None:
+                for j in range(self.d_updates_per_g):  # 评论器多次更新
+                    self.c_optimizer.zero_grad(set_to_none=True)
 
-                    # 生成假图像
-                    with torch.no_grad():
-                        fake_images = self.generator(low_images)
+                    with autocast(enabled=self.args.autocast):
+                        # 生成假图像（不需要计算梯度）
+                        with torch.no_grad():
+                            fake_images = self.generator(low_images)
 
-                    # 检查生成的图像是否包含NaN
-                    if torch.isnan(fake_images).any():
-                        self.log_message("警告: 生成器输出包含NaN值，跳过此批次")
-                        break
+                        # 快速检查是否有NaN值并跳过
+                        if torch.isnan(fake_images).any():
+                            continue
 
-                    # 添加噪声到输入
-                    real_with_noise = self.add_noise_to_input(high_images)
-                    fake_with_noise = self.add_noise_to_input(
-                        fake_images.detach())
+                        # 为真假图像增加噪声（批量处理）
+                        real_with_noise = high_images + \
+                            torch.randn_like(high_images) * noise_factor
+                        fake_with_noise = fake_images.detach() + torch.randn_like(fake_images) * noise_factor
 
-                    # 评论器对真假图像的评价
-                    critic_real = self.critic(real_with_noise)
-                    critic_fake = self.critic(fake_with_noise)
+                        # 计算critic输出
+                        critic_real = self.critic(real_with_noise)
+                        critic_fake = self.critic(fake_with_noise)
 
-                    # 检查评论器输出是否包含NaN
-                    if torch.isnan(critic_real).any() or torch.isnan(critic_fake).any():
-                        self.log_message("警告: 评论器输出包含NaN值，跳过此批次")
-                        break
+                        # 如果输出包含NaN，跳过此次迭代
+                        if torch.isnan(critic_real).any() or torch.isnan(critic_fake).any():
+                            continue
 
-                    # 计算梯度惩罚
-                    gradient_penalty = compute_gradient_penalty(self.critic,
-                                                                real_with_noise, fake_with_noise)
+                        # 计算Wasserstein距离和梯度惩罚
+                        wasserstein_distance = torch.mean(
+                            critic_real) - torch.mean(critic_fake)
+                        gradient_penalty = compute_gradient_penalty(self.critic,
+                                                                    real_with_noise,
+                                                                    fake_with_noise,
+                                                                    self.lambda_gp)
 
-                    # 检查梯度惩罚是否为NaN
-                    if torch.isnan(gradient_penalty).any():
-                        self.log_message("警告: 梯度惩罚计算结果为NaN，跳过此批次")
-                        break
+                        # 如果梯度惩罚为NaN，使用零惩罚
+                        if torch.isnan(gradient_penalty).any():
+                            gradient_penalty = torch.tensor(
+                                0.0, device=self.device, requires_grad=True)
 
-                    # 计算Wasserstein距离和总损失
-                    wasserstein_distance = torch.mean(
-                        critic_real) - torch.mean(critic_fake)
-                    loss_critic = -wasserstein_distance + self.lambda_gp * gradient_penalty
+                        # 计算总critic损失
+                        loss_critic = -wasserstein_distance + self.lambda_gp * gradient_penalty
 
-                    # 检查损失值是否为NaN
-                    if self._check_nan_values(loss_critic, "评论器"):
-                        break
+                    # 使用scaler处理反向传播（混合精度）
+                    scaler_c.scale(loss_critic).backward()
 
-                    # 累积损失
-                    c_loss_accumulator += loss_critic.item()
+                    # 记录损失值
+                    critic_loss_batch = loss_critic.item()
+                    critic_loss.append(critic_loss_batch)
 
-                    # 使用scaler进行反向传播和优化器步进
-                    loss_critic.backward()
-                    self.c_optimizer.step()
-
-                    # 检查梯度是否包含NaN
-                    if self.critic is not None:
-                        if self._check_gradients(self.critic, "评论器"):
-                            break
-
-                    # 梯度累积
+                    # 应用梯度裁剪并更新参数
                     if (j == self.d_updates_per_g - 1) and (batch_count % self.grad_accum_steps == 0 or i == len(self.train_loader) - 1):
-                        # 梯度裁剪
-                        if self.critic is not None and self.c_optimizer is not None:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.critic.parameters(), 1.0)
-                            self.c_optimizer.step()
+                        scaler_c.unscale_(self.c_optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.critic.parameters(), 1.0)
+                        scaler_c.step(self.c_optimizer)
+                        scaler_c.update()
 
-                # 如果检测到NaN，跳过生成器训练
-                if self.nan_detected:
-                    continue
+            # ============================
+            # 训练生成器（Generator）
+            # ============================
+            # 清空生成器梯度
+            self.g_optimizer.zero_grad(set_to_none=True)
 
-                # 训练生成器
-                self.g_optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
-
-                # 生成新的假图像
+            with autocast(enabled=self.args.autocast):
+                # 生成假图像
                 fake_images = self.generator(low_images)
 
-                # 检查生成的图像是否包含NaN
+                # 检查输出是否有NaN值
                 if torch.isnan(fake_images).any():
-                    self.log_message("警告: 生成器输出包含NaN值，跳过此批次")
                     continue
 
-                # 评论器对新生成的假图像的评价
-                critic_fake = self.critic(fake_images)
+                # 计算生成器损失
+                if self.critic is not None:
+                    # 使用WGAN-GP的生成器损失（无需添加噪声，因为我们希望最大化critic得分）
+                    critic_fake = self.critic(fake_images)
 
-                # 检查评论器输出是否包含NaN
-                if torch.isnan(critic_fake).any():
-                    self.log_message("警告: 评论器输出包含NaN值，跳过此批次")
-                    continue
+                    # 计算WGAN生成器损失
+                    # 希望最大化critic对假图像的评分
+                    loss_generator = -torch.mean(critic_fake)
 
-                # 计算生成器损失 - 使用简化的损失计算函数
-                loss_generator = self.compute_generator_loss(
-                    critic_fake, fake_images, high_images)
-
-                # 检查损失值是否为NaN
-                if self._check_nan_values(loss_generator, "生成器"):
-                    continue
-
-                g_loss_accumulator += loss_generator.item()
-
-                # 记录评论器对假图像的平均评分
-                g_z = critic_fake.mean().item()
-
-                # 使用scaler进行反向传播
-                loss_generator.backward()
-                self.g_optimizer.step()
-
-                # 检查梯度是否包含NaN
-                if self._check_gradients(self.generator, "生成器"):
-                    break
-
-                # 梯度累积
-                if batch_count % self.grad_accum_steps == 0 or i == len(self.train_loader) - 1:
-                    # 梯度裁剪，防止梯度爆炸
-                    torch.nn.utils.clip_grad_norm_(
-                        self.generator.parameters(), 5.0)
-                    self.g_optimizer.step()
-
-                    # 记录损失
-                    gen_loss.append(g_loss_accumulator / self.grad_accum_steps)
-                    critic_loss.append(c_loss_accumulator /
-                                       self.grad_accum_steps)
-
-                    # 重置累积器
-                    g_loss_accumulator = 0
-                    c_loss_accumulator = 0
-                    batch_count = 0
-
-                source_g.append(g_z)
-
-                # 更新进度条描述
-                if hasattr(self, 'rich_available') and self.rich_available and progress is not None and task_id is not None:
-                    epoch_info = f"Epoch: [{self.epoch + 1}/{self.args.epochs}]"
-                    batch_info = f"Batch: [{i + 1}/{len(self.train_loader)}]"
-                    loss_info = f"C: {loss_critic.item():.4f} | G: {loss_generator.item():.4f}"
-                    metrics = f"G(z): {g_z:.3f}"
-
-                    # 安全获取学习率
-                    lr_g = self.g_optimizer.param_groups[0]['lr'] if hasattr(
-                        self, 'g_optimizer') and self.g_optimizer is not None else 0
-                    lr_c = self.c_optimizer.param_groups[0]['lr'] if hasattr(
-                        self, 'c_optimizer') and self.c_optimizer is not None else 0
-                    lr_info = f"lr_G: {lr_g:.6f} | lr_C: {lr_c:.6f}"
-
-                    progress.update(
-                        task_id, advance=1, description=f"[cyan]{epoch_info} | {batch_info} | {loss_info} | {metrics} | {lr_info}")
+                    # 记录G(z)值用于监控
+                    g_z_value = torch.mean(critic_fake).item()
                 else:
-                    epoch_info = f"Epoch: [{self.epoch + 1}/{self.args.epochs}]"
-                    batch_info = f"Batch: [{i + 1}/{len(self.train_loader)}]"
-                    loss_info = f"C: {loss_critic.item():.4f} | G: {loss_generator.item():.4f}"
-                    metrics = f"G(z): {g_z:.3f}"
+                    # 这种情况不应该发生，因为WGAN_GPTrainer应该总是有critic
+                    loss_generator = torch.tensor(0.0, device=self.device)
 
-                    # 添加学习率信息
-                    lr_g = self.g_optimizer.param_groups[0]['lr'] if hasattr(
-                        self, 'g_optimizer') and self.g_optimizer is not None else 0
-                    lr_c = self.c_optimizer.param_groups[0]['lr'] if hasattr(
-                        self, 'c_optimizer') and self.c_optimizer is not None else 0
-                    lr_info = f"lr_G: {lr_g:.6f} | lr_C: {lr_c:.6f}"
+                # 添加内容损失（L1损失），如果启用
+                if hasattr(self, 'content_weight') and self.content_weight > 0:
+                    content_loss = F.l1_loss(fake_images, high_images)
+                    loss_generator = loss_generator + self.content_weight * content_loss
 
-                    if 'pbar' in locals():
-                        pbar.set_description(
-                            f"🔄 {epoch_info} | {batch_info} | 📉 {loss_info} | 📊 {metrics} | 🔍 {lr_info}"
-                        )
+                # 添加感知损失，如果启用
+                if hasattr(self, 'perception_weight') and self.perception_weight > 0 and hasattr(self, 'perceptual_loss'):
+                    perceptual_loss = self.perceptual_loss(
+                        fake_images, high_images)
+                    loss_generator = loss_generator + self.perception_weight * perceptual_loss
 
-                # 每个epoch结束时保存检查点，而不是每个batch
-                if i == len(self.train_loader) - 1:
-                    self.save_checkpoint()
+            # 使用scaler处理反向传播
+            scaler_g.scale(loss_generator).backward()
+
+            # 记录损失
+            gen_loss.append(loss_generator.item())
+
+            # 梯度累积处理
+            if batch_count % self.grad_accum_steps == 0 or i == len(self.train_loader) - 1:
+                # 梯度裁剪
+                scaler_g.unscale_(self.g_optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.generator.parameters(), 5.0)
+                scaler_g.step(self.g_optimizer)
+                scaler_g.update()
+
+            # 更新学习率调度器
+            if self.scheduler_g is not None and batch_count % self.grad_accum_steps == 0:
+                self.scheduler_g.step()
+            if self.scheduler_d is not None and batch_count % self.grad_accum_steps == 0:
+                self.scheduler_d.step()
+
+            # ============================
+            # 更新进度条
+            # ============================
+            # 仅当存在有效损失时才更新进度条
+            if len(gen_loss) > 0 and (len(critic_loss) > 0 or self.critic is None):
+                # 准备进度条信息
+                epoch_info = f"Epoch: [{self.epoch + 1}/{self.args.epochs}]"
+                batch_info = f"Batch: [{i + 1}/{len(self.train_loader)}]"
+
+                # 获取最新损失
+                g_loss_display = gen_loss[-1]
+                c_loss_display = critic_loss[-1] if len(
+                    critic_loss) > 0 else 0.0
+
+                loss_info = f"C: {c_loss_display:.4f} | G: {g_loss_display:.4f}"
+                metrics = f"G(z): {g_z_value:.3f}"
+
+                # 获取学习率信息
+                lr_g = self.g_optimizer.param_groups[0]['lr']
+                lr_c = self.c_optimizer.param_groups[0]['lr'] if self.c_optimizer is not None else 0.0
+                lr_info = f"lr_G: {lr_g:.6f} | lr_C: {lr_c:.6f}"
+
+                # 更新Rich进度条或tqdm进度条
+                if hasattr(self, 'rich_available') and self.rich_available and progress is not None and task_id is not None:
+                    progress.update(task_id, advance=1,
+                                    description=f"[cyan]{epoch_info} | {batch_info} | {loss_info} | {metrics} | {lr_info}")
+                elif 'pbar' in locals():
+                    pbar.set_description(
+                        f"🔄 {epoch_info} | {batch_info} | 📉 {loss_info} | 📊 {metrics} | 🔍 {lr_info}")
 
         # 关闭进度条
         if hasattr(self, 'rich_available') and self.rich_available and progress is not None:
@@ -1203,19 +1228,21 @@ class WGAN_GPTrainer(BaseTrainer):
         elif 'pbar' in locals():
             pbar.close()
 
-        # 记录训练日志
-        self.write_log(self.epoch, gen_loss, critic_loss, 0, 0, g_z)
+        # 计算平均损失
+        avg_gen_loss = np.mean(gen_loss) if gen_loss else 0
+        avg_critic_loss = np.mean(critic_loss) if critic_loss else 0
 
         # 打印训练摘要
-        metrics = {
-            "G(z)": g_z,
-            "PSNR": self.evaluate_model() if self.epoch % 5 == 0 else "未计算"
-        }
-        self.print_epoch_summary(self.epoch, gen_loss, critic_loss, metrics)
+        self.print_epoch_summary(self.epoch, avg_gen_loss, avg_critic_loss)
 
-        # 可视化结果
+        # 保存检查点和可视化结果
+        self.save_checkpoint()
+
+        # 可视化结果（使用最后一个批次的图像）
         self.visualize_results(
             self.epoch, gen_loss, critic_loss, high_images, low_images, fake_images)
+
+        return avg_gen_loss, avg_critic_loss
 
 
 def train(args):
@@ -1251,7 +1278,17 @@ class BasePredictor:
         self.generator = Generator(1, 1)
         model_structure(
             self.generator, (3, 256, 256))
-        checkpoint = torch.load(self.model)
+        try:
+            # First try loading with weights_only=True (safer)
+            checkpoint = torch.load(
+                self.model, map_location=self.device, weights_only=True)
+        except Exception as e:
+            print(
+                "Warning: Failed to load with weights_only=True, attempting legacy loading...")
+            # If that fails, try the legacy loading method
+            checkpoint = torch.load(
+                self.model, map_location=self.device, weights_only=False)
+
         self.generator.load_state_dict(checkpoint['net'])
         self.generator.to(self.device)
         self.generator.eval()
@@ -1445,57 +1482,52 @@ def predict(args):
 
 
 def compute_gradient_penalty(critic, real_samples, fake_samples, lambda_gp=10.0):
-    """计算梯度惩罚 - 改进版本，增加数值稳定性"""
-    # 确保输入没有NaN
+    """计算WGAN-GP的梯度惩罚 - 优化版本，增加数值稳定性和效率"""
+    # 简单检查输入是否有NaN值
     if torch.isnan(real_samples).any() or torch.isnan(fake_samples).any():
-        # 如果输入包含NaN，返回零惩罚
         return torch.tensor(0.0, device=real_samples.device, requires_grad=True)
 
     batch_size = real_samples.size(0)
+    device = real_samples.device
 
-    # 生成随机插值系数
-    alpha = torch.rand(batch_size, 1, 1, 1, device=real_samples.device)
+    # 为每个样本生成随机插值系数
+    alpha = torch.rand(batch_size, 1, 1, 1, device=device)
 
-    # 创建插值样本
-    interpolates = real_samples + alpha * (fake_samples - real_samples)
+    # 创建真实样本和生成样本之间的随机插值点
+    interpolates = alpha * real_samples + (1 - alpha) * fake_samples
     interpolates.requires_grad_(True)
 
-    # 计算评论器对插值样本的输出
-    critic_interpolates = critic(interpolates)
+    # 评估评论器在插值点的输出
+    try:
+        critic_interpolates = critic(interpolates)
+    except RuntimeError:
+        # 如果评论器评估失败，返回零惩罚
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # 创建梯度输出
-    grad_outputs = torch.ones_like(
-        critic_interpolates, device=real_samples.device)
-
-    # 计算梯度
+    # 计算相对于插值点的梯度
     try:
         gradients = torch.autograd.grad(
             outputs=critic_interpolates,
             inputs=interpolates,
-            grad_outputs=grad_outputs,
+            grad_outputs=torch.ones_like(critic_interpolates, device=device),
             create_graph=True,
             retain_graph=True,
-            only_inputs=True,
+            only_inputs=True
         )[0]
     except RuntimeError:
         # 如果梯度计算失败，返回零惩罚
-        print("警告: 梯度计算失败，返回零惩罚")
-        return torch.tensor(0.0, device=real_samples.device, requires_grad=True)
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # 检查梯度是否包含NaN
-    if torch.isnan(gradients).any():
-        print("警告: 梯度包含NaN，返回零惩罚")
-        return torch.tensor(0.0, device=real_samples.device, requires_grad=True)
+    # 检查梯度是否包含NaN/Inf
+    if torch.isnan(gradients).any() or torch.isinf(gradients).any():
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # 展平梯度并计算范数
+    # 展平并计算梯度的L2范数
     gradients = gradients.view(batch_size, -1)
+    gradient_norm = torch.sqrt(
+        torch.sum(gradients ** 2, dim=1) + 1e-8)  # 添加小值以防止除零
 
-    # 添加小的epsilon值以防止除零错误
-    epsilon = 1e-10
-    gradient_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + epsilon)
-
-    # 计算惩罚 - 使用clamp防止极端值
-    gradient_penalty = torch.mean((gradient_norm - 1.0) ** 2)
-    gradient_penalty = torch.clamp(gradient_penalty, 0.0, 1000.0)  # 限制惩罚范围
+    # 计算梯度惩罚：(||∇D(x̃)||₂ - 1)²
+    gradient_penalty = ((gradient_norm - 1) ** 2).mean() * lambda_gp
 
     return gradient_penalty
