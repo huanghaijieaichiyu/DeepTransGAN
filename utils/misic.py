@@ -2,19 +2,19 @@ import os
 import random
 from copy import copy
 from math import exp
-
+import cv2
+from PIL import Image
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ptflops import get_model_complexity_info
 from timm.optim import Lion, RMSpropTF
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from torch.optim import Adam, AdamW, SGD
-from torchvision import transforms
+from rich.console import Console
+from rich.table import Table
 
-from datasets.data_set import LowLightDataset
 from utils.loss import BCEBlurWithLogitsLoss, FocalLoss
 
 
@@ -229,52 +229,168 @@ def save_path(path: str, model: str = 'train') -> str:
 
 def model_structure(model, img_size: tuple[int, int, int]) -> tuple[float, float]:
     """
-    Prints a detailed structure of the PyTorch model, including layer names, shapes,
-    parameter counts, and total model size. Similar layers are grouped for better readability.
+    打印PyTorch模型的详细结构，包括层名称、形状、参数数量和总模型大小。
+    使用ptflops计算FLOPs，使用rich库美化输出。
 
     Args:
-        model (nn.Module): The PyTorch model to analyze.
-        img_size (tuple[int, int, int]): Input image size (C, H, W).
+        model (nn.Module): 要分析的PyTorch模型。
+        img_size (tuple[int, int, int]): 输入图像大小 (C, H, W)。
 
     Returns:
-        tuple[float, float]: A tuple containing the number of parameters (in millions)
-                             and the number of GFLOPs.
+        tuple[float, float]: 包含参数数量(百万)和GFLOPs的元组。
     """
+    try:
+        from ptflops import get_model_complexity_info
+        from rich.console import Console
+        from rich.table import Table
+    except ImportError:
+        print("请安装必要的库: pip install ptflops rich")
+        return 0, 0
 
-    blank = ' '
-    print('-' * 142)
-    print(f'|{"Layer Name":^70}|{"Weight Shape":^45}|{"#Params":^15}|')
-    print('-' * 142)
+    console = Console()
 
-    num_para = 0
-    type_size = 4  # Assuming float32
-    macs, _ = get_model_complexity_info(model, img_size, as_strings=False, print_per_layer_stat=False,
-                                        verbose=False)
+    # 创建表格
+    table = Table(title=f"模型结构分析: {model.__class__.__name__}")
+    table.add_column("层名称", style="cyan")
+    table.add_column("参数形状", style="green")
+    table.add_column("参数数量", justify="right", style="yellow")
 
-    layer_summary = {}
+    # 计算每层参数
+    total_params = 0
     for name, param in model.named_parameters():
-        shape = str(param.shape)
-        each_para = param.numel()  # 更简洁的写法
-        num_para += each_para
-        if shape not in layer_summary:
-            layer_summary[shape] = {"names": [], "count": 0, "params": 0}
-        layer_summary[shape]["names"].append(name)
-        layer_summary[shape]["count"] += 1
-        layer_summary[shape]["params"] += each_para
+        if param.requires_grad:
+            param_count = param.numel()
+            total_params += param_count
+            # 简化名称显示
+            name = name.replace("module.", "")
+            shape_str = str(list(param.shape))
+            table.add_row(name, shape_str, f"{param_count:,}")
 
-    for shape, data in layer_summary.items():
-        names = ", ".join(data["names"])
-        if len(names) > 67:
-            names = names[:64] + "..."  # 截断过长的层名称
-        num_str = str(data["params"])
-        print(f'|{names:<70}|{shape:<45}|{num_str:>15}|')
+    # 使用ptflops计算FLOPs
+    macs, params = get_model_complexity_info(
+        model,
+        (img_size[0], img_size[1], img_size[2]),
+        as_strings=False,
+        print_per_layer_stat=False
+    )
 
-    print('-' * 142)
-    print(f'Total Parameters: {num_para}')
-    print(
-        f'Model Size ({model._get_name()}): {num_para * type_size / 1e6:.2f} MB')
-    # type: ignore
-    print(f'GFLOPs ({model._get_name()}): {2 * macs * 1e-9:.2f} G')
-    print('-' * 142)
+    # 确保macs是数值类型
+    macs_value = float(macs) if macs is not None else 0.0
 
-    return num_para * 1e-6, 2 * macs * 1e-9  # type: ignore
+    # 添加总结行
+    table.add_section()
+    table.add_row(
+        "[bold]总计[/bold]",
+        "",
+        f"[bold]{total_params:,}[/bold]"
+    )
+
+    # 打印表格
+    console.print(table)
+
+    # 打印总结信息
+    console.print(
+        f"[bold]模型大小:[/bold] {total_params * 4 / (1024**2):.2f} MB (假设FP32精度)")
+    console.print(f"[bold]计算量:[/bold] {macs_value * 2 * 1e-9:.2f} GFLOPs")
+
+    return total_params * 1e-6, macs_value * 2 * 1e-9
+
+
+def compress_gif(input_path: str, output_path: str, max_size_mb: float = 1.0) -> bool:
+    """
+    压缩GIF文件到指定大小，通过自动调整抽帧比例和图像质量。
+
+    Args:
+        input_path (str): 输入GIF文件路径
+        output_path (str): 输出GIF文件路径
+        max_size_mb (float): 最大文件大小（MB），默认1MB
+
+    Returns:
+        bool: 压缩是否成功
+    """
+    try:
+        # 读取原始GIF
+        gif = Image.open(input_path)
+        frames = []
+        durations = []
+
+        # 获取所有帧
+        try:
+            while True:
+                frames.append(gif.copy())
+                durations.append(gif.info.get('duration', 100))  # 默认100ms
+                gif.seek(gif.tell() + 1)
+        except EOFError:
+            pass
+
+        original_frame_count = len(frames)
+        if original_frame_count < 2:
+            return False
+
+        # 计算目标大小（以字节为单位）
+        max_size_bytes = max_size_mb * 1024 * 1024
+        current_size = os.path.getsize(input_path)
+
+        # 计算初始压缩比例
+        compression_ratio = max_size_bytes / current_size
+        target_frame_count = max(
+            2, int(original_frame_count * compression_ratio))
+
+        # 计算抽帧间隔
+        frame_interval = max(1, original_frame_count // target_frame_count)
+
+        # 抽取帧并转换为OpenCV格式进行处理
+        compressed_frames = []
+        for i in range(0, len(frames), frame_interval):
+            # 将PIL图像转换为OpenCV格式
+            frame = frames[i]
+            frame_array = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
+
+            # 如果需要，可以调整图像大小
+            if current_size > max_size_bytes * 2:  # 如果原始文件太大，则缩小图像
+                scale = np.sqrt(compression_ratio)
+                new_size = (int(frame_array.shape[1] * scale),
+                            int(frame_array.shape[0] * scale))
+                frame_array = cv2.resize(frame_array, new_size,
+                                         interpolation=cv2.INTER_AREA)
+
+            # 转回PIL格式
+            frame_rgb = cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB)
+            compressed_frames.append(Image.fromarray(frame_rgb))
+
+        # 计算新的帧持续时间
+        new_duration = sum(durations) / len(durations) * frame_interval
+
+        # 保存压缩后的GIF
+        compressed_frames[0].save(
+            output_path,
+            save_all=True,
+            append_images=compressed_frames[1:],
+            optimize=True,
+            duration=new_duration,
+            loop=0
+        )
+
+        # 验证文件大小
+        final_size = os.path.getsize(output_path)
+        if final_size > max_size_bytes:
+            # 如果仍然太大，可以尝试进一步压缩质量
+            quality = 85
+            while final_size > max_size_bytes and quality > 30:
+                compressed_frames[0].save(
+                    output_path,
+                    save_all=True,
+                    append_images=compressed_frames[1:],
+                    optimize=True,
+                    duration=new_duration,
+                    loop=0,
+                    quality=quality
+                )
+                final_size = os.path.getsize(output_path)
+                quality -= 10
+
+        return os.path.exists(output_path) and os.path.getsize(output_path) <= max_size_bytes
+
+    except Exception as e:
+        print(f"压缩GIF时发生错误: {str(e)}")
+        return False

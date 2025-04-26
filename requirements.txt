@@ -1,14 +1,30 @@
-torch
-opencv-python<=4.9.0.80
-imageio<=2.14.0
-numpy<=1.26.3
-timm<=0.9.16
-torchvision
-tqdm<=4.65.0
-ptflops<= 0.7.2.2
-torcheval<=0.70
-rich~=13.7.1
-# 测试用
-cython
+# 深度学习基础框架
+torch>=2.2.1
+torchvision>=0.17.1
+timm>=0.9.12
 
-PyYAML~=6.0.1
+# 数据处理和科学计算
+numpy>=1.26.4
+Pillow>=10.2.0
+opencv-python>=4.9.0.80
+scikit-image>=0.22.0
+imageio>=2.34.0
+
+# 可视化和日志
+matplotlib>=3.8.3
+tensorboard>=2.15.1
+rich>=13.7.0
+
+# 模型分析和评估
+ptflops>=0.7.2
+torcheval>=0.0.7
+
+# 进度显示
+tqdm>=4.66.2
+
+# 配置文件支持
+PyYAML>=6.0.1
+
+# 可选依赖
+# 如果需要GPU支持，取消下面的注释
+# cupy-cuda12x>=12.3.0  # 根据您的CUDA版本选择适当的版本

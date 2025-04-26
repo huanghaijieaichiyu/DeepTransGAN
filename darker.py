@@ -3,103 +3,174 @@ import os
 import numpy as np
 from tqdm import tqdm
 import random
+from typing import Optional, Union
+from pathlib import Path
 
 
 class Darker:
-    def __init__(self, data_dir=None, ratio=0.5, phase="train"):
-        """
+    def __init__(
+        self,
+        data_dir: Optional[Union[str, Path]] = None,
+        ratio: float = 0.5,
+        phase: str = "train"
+    ):
+        """Initialize the Darker class for image/video darkening.
+
         Args:
-            data_dir (str或None): 数据集根目录，仅对处理图像有效。如果为 None，则无法调用process_images方法。
-            ratio (float): 亮度降低的比例，0到1之间。
-            phase (str): 阶段，可选值为 "train" 或 "test"。
+            data_dir: Root directory of the dataset. Required for image processing.
+                If None, process_images method cannot be called.
+            ratio: Brightness reduction ratio between 0 and 1.
+            phase: Processing phase, either "train" or "test".
+
+        Raises:
+            ValueError: If ratio is not between 0 and 1 or phase is invalid.
         """
+        if not 0 <= ratio <= 1:
+            raise ValueError("Ratio must be between 0 and 1")
+        if phase not in ["train", "test"]:
+            raise ValueError('Phase must be either "train" or "test"')
+
         self.ratio = ratio
         self.phase = phase
-        self.data_dir = data_dir
-        if data_dir:  # 针对图像处理
-            self.high_dir = os.path.join(
-                data_dir, "our485", "high") if phase == "train" else os.path.join(data_dir, "eval15", "high")
-            self.low_dir = os.path.join(
-                data_dir, "our485", "low") if phase == "train" else os.path.join(data_dir, "eval15", "low")
+        self.data_dir = Path(data_dir) if data_dir else None
+
+        if self.data_dir:
+            base_dir = "our485" if phase == "train" else "eval15"
+            self.high_dir = self.data_dir / base_dir / "high"
+            self.low_dir = self.data_dir / base_dir / "low"
             os.makedirs(self.low_dir, exist_ok=True)
 
+            if not self.high_dir.exists():
+                raise FileNotFoundError(
+                    f"High-quality images directory not found: {self.high_dir}"
+                )
+
     @staticmethod
-    def adjust_image(img, ratio):
+    def adjust_image(img: np.ndarray, ratio: float) -> np.ndarray:
+        """Apply darkening effect to the input image.
+
+        Args:
+            img: Input image in BGR format.
+            ratio: Brightness reduction ratio.
+
+        Returns:
+            Darkened image in BGR format.
         """
-        对传入的图像执行暗化处理
-        """
-        seed = random.uniform(0, 1)
+        if img is None:
+            raise ValueError("Input image cannot be None")
+
+        seed = random.uniform(0.5, 1)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        hsv[:, :, 2] = np.clip(hsv[:, :, 2].astype(np.float32) * ratio, 0, 255)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1].astype(
-            np.float32) * seed, 0, 255)
-        hsv[:, :, 0] = np.clip(hsv[:, :, 0].astype(
-            np.float32) * 0.5 * seed, 0, 255)
+        hsv = hsv.astype(np.float32)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * ratio * seed, 0, 255)
+        hsv = hsv.astype(np.uint8)
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    def process_images(self):
+    def process_images(self) -> None:
+        """Batch process images to generate low-light versions.
+
+        Raises:
+            RuntimeError: If data_dir was not provided during initialization.
+            FileNotFoundError: If no valid images found in high_dir.
         """
-        批量生成低光照图像
-        """
-        image_files = [f for f in os.listdir(self.high_dir) if f.lower().endswith(
-            ('.png', '.jpg', '.jpeg', '.bmp'))]
-        print("开始处理图像数据集...")
+        if not self.data_dir:
+            raise RuntimeError(
+                "Data directory not provided during initialization")
+
+        image_files = [
+            f for f in os.listdir(self.high_dir)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+        ]
+
+        if not image_files:
+            raise FileNotFoundError(
+                f"No valid images found in {self.high_dir}")
+
+        print(f"Processing {len(image_files)} images...")
         for image_file in tqdm(image_files):
-            high_img_path = os.path.join(self.high_dir, image_file)
-            high_img = cv2.imread(high_img_path)
+            high_img_path = self.high_dir / image_file
+            high_img = cv2.imread(str(high_img_path))
+
             if high_img is None:
-                print(f"无法读取图像: {high_img_path}")
+                print(f"Warning: Could not read image: {high_img_path}")
                 continue
-            dark_img = self.adjust_image(high_img, self.ratio)
-            low_img_path = os.path.join(self.low_dir, image_file)
-            cv2.imwrite(low_img_path, dark_img)
-        print("图像处理完成！请手动检查数据集。")
 
-    def process_video(self, video_path, output_path="dark_video.mp4"):
-        """
-        生成低光照视频
+            try:
+                dark_img = self.adjust_image(high_img, self.ratio)
+                low_img_path = self.low_dir / image_file
+                cv2.imwrite(str(low_img_path), dark_img)
+            except Exception as e:
+                print(f"Error processing {image_file}: {str(e)}")
+
+        print("Image processing completed! Please check the dataset manually.")
+
+    def process_video(
+        self,
+        video_path: Union[str, Path],
+        output_path: Union[str, Path] = "dark_video.mp4"
+    ) -> None:
+        """Generate a low-light version of the input video.
+
         Args:
-            video_path (str): 源视频路径
-            output_path (str): 输出视频路径
+            video_path: Path to the source video file.
+            output_path: Path for the output darkened video.
+
+        Raises:
+            FileNotFoundError: If the input video file doesn't exist.
+            RuntimeError: If video processing fails.
         """
-        cap = cv2.VideoCapture(video_path)
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            print("无法打开视频文件！")
-            return
+            raise RuntimeError(f"Failed to open video file: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter.fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        print("开始处理视频...")
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            dark_frame = self.adjust_image(frame, self.ratio)
-            out.write(dark_frame)
+            # Ignore false positive linter error for VideoWriter_fourcc
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore
+            out = cv2.VideoWriter(
+                str(output_path), fourcc, fps, (width, height))
 
-        cap.release()
-        out.release()
-        cv2.destroyAllWindows()
-        print("视频处理完成！")
+            print(f"Processing video with {total_frames} frames...")
+            with tqdm(total=total_frames) as pbar:
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    dark_frame = self.adjust_image(frame, self.ratio)
+                    out.write(dark_frame)
+                    pbar.update(1)
+
+        finally:
+            cap.release()
+            out.release()
+            cv2.destroyAllWindows()
+
+        print(f"Video processing completed! Output saved to: {output_path}")
 
 
 if __name__ == '__main__':
-    # 处理图像示例
-    data_dir = "../datasets/kitti_LOL"  # 替换成你的数据集路径
-    ratio = 0.1  # 亮度降低的比例
+    # Example usage for image processing
+    data_dir = "../datasets/NuScenes"  # Replace with your dataset path
+    ratio = 0.1  # Brightness reduction ratio
 
-    # 处理 train 和 test 两个阶段的图像数据集
-    darker_train = Darker(data_dir, ratio=ratio, phase="train")
-    darker_train.process_images()
+    # Process both train and test phase image datasets
+    for phase in ["train", "test"]:
+        try:
+            darker = Darker(data_dir, ratio=ratio, phase=phase)
+            darker.process_images()
+        except Exception as e:
+            print(f"Error processing {phase} phase: {str(e)}")
 
-    darker_test = Darker(data_dir, ratio=ratio, phase="test")
-    darker_test.process_images()
-
-    # 若需处理视频，传入视频路径
-    # video_path = "examples/upc_dark.mp4"
+    # Example usage for video processing
+    # video_path = "examples/input.mp4"
     # darker_video = Darker(ratio=ratio)
-    # darker_video.process_video(video_path)
+    # darker_video.process_video(video_path, "examples/output_dark.mp4")

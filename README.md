@@ -1,145 +1,212 @@
-# DeepTransformerGAN-DTGAN：低照度图像修复
+# DeepTranserGAN - 低光照图像增强
 
-## Languages
+这是一个基于PyTorch的深度学习项目，用于低光照图像增强。该项目使用生成对抗网络(GAN)和Wasserstein GAN with Gradient Penalty (WGAN-GP)来实现从低光照图像到正常光照图像的转换。
 
-*   [English](README_en.md)
+## 项目特点
 
+- 支持多种GAN架构（标准GAN和WGAN-GP）
+- 优化的注意力机制和特征提取
+- 高效的训练策略（梯度累积、混合精度训练）
+- 完善的评估指标（PSNR、SSIM）
+- 支持图像和视频处理
 
-本项目实现了一种深度学习方法，用于对灰度图像进行着色。它使用了一种改进的DCGAN（深度卷积生成对抗网络）架构，具有自注意力机制、跨层连接和残差块。该模型在转换为LAB颜色空间的RGB图像上进行训练，使用A和B通道作为颜色信息标签。
+## 效果展示
 
-## 效果
-LOL数据集预测结果：
-![Real](examples/real.png)
-![fake](examples/fake.png)
+### 图像增强效果
 
-## 安装
+下面展示了模型对低光照图像的增强效果：
 
-1.  克隆存储库：
+| 输入（低光照） | 输出（增强后） |
+|:-------------:|:-------------:|
+| ![低光照图像](examples/real.png) | ![增强后图像](examples/fake.png) |
 
-    ```bash
-    git clone <repository_url>
-    cd INR2RGB
-    ```
+### 视频增强效果
 
-2.  安装所需的依赖项：
+您可以通过以下链接查看和下载示例视频：
 
-    ```bash
-    pip install -r requirements.txt
-    ```
+- 处理前视频：[下载链接](https://cloud.189.cn/web/share?code=YJVnyqqYJBru)（访问码：8lkp）
+- 处理后视频：[下载链接](https://cloud.189.cn/web/share?code=J3q2uyiMRJvi)（访问码：lmw6）
 
-    `requirements.txt` 文件包含以下软件包：
+### 预训练模型
 
-    ```
-    torch
-    opencv-python<=4.9.0.80
-    numpy<=1.26.3
-    timm<=0.9.16
-    torchvision
-    tqdm<=4.65.0
-    ptflops<= 0.7.2.2
-    torcheval<=0.70
-    rich~=13.7.1
-    cython
-    PyYAML~=6.0.1
-    ```
+我们提供了基于KITTI数据集训练的预训练模型：
+- 模型下载：[下载链接](https://cloud.189.cn/web/share?code=2yuIVbFreMjq)（访问码：rbr4）
 
-## 用法
+## 环境要求
 
-### 训练
+- Python 3.8+
+- PyTorch 1.10+
+- CUDA (推荐用于加速训练)
 
-要训练模型，请运行 `train.py` 脚本：
+## 安装步骤
+
+1. 克隆仓库：
 
 ```bash
-python train.py --data <数据集路径> --epochs <训练轮数> --batch_size <批次大小>
+git clone https://github.com/yourusername/DeepTranserGAN.git
+cd DeepTranserGAN
 ```
 
-*   `--data`: 数据集目录的路径（例如，`../datasets/LOLdataset`）。
-*   `--epochs`: 训练轮数（默认值：500）。
-*   `--batch_size`: 批次大小（默认值：16）。
-*   `--img_size`: 输入图像的大小（默认值：(256, 256)）。
-*   `--optimizer`: 要使用的优化器（默认值：Adam）。
-*   `--num_workers`: 数据加载器的工作线程数（默认值：0）。在Windows中必须设置为0。
-*   `--seed`: 用于重现性的随机种子（默认值：随机整数）。
-*   `--resume`: 用于恢复训练的检查点路径。
-*   `--amp`: 是否使用自动混合精度（AMP）进行训练。
-*   `--cuDNN`: 是否使用cuDNN进行加速训练。
-*   `--loss`: 要使用的损失函数（默认值：bce）。
-*   `--lr`: 学习率（默认值：3.5e-4）。
-*   `--momentum`: SGD优化器的动量（默认值：0.5）。
-*   `--depth`: 生成器的深度（默认值：1）。
-*   `--weight`: 生成器的权重（默认值：1）。
-*   `--device`: 用于训练的设备（默认值：cuda）。
-*   `--save_path`: 用于保存训练结果的目录（默认值：runs/）。
-*   `--benchmark`: 是否使用 `torch.benchmark` 来加速训练。
-*   `--deterministic`: 是否使用确定性初始化。
-*   `--draw_model`: 是否将模型图绘制到TensorBoard。
-
-示例：
+2. 创建并激活虚拟环境（可选但推荐）：
 
 ```bash
-python train.py --data ../datasets/LOLdataset --epochs 200 --batch_size 32
+# 使用conda
+conda create -n deepgan python=3.8
+conda activate deepgan
+
+# 或使用venv
+python -m venv deepgan
+# Windows
+deepgan\Scripts\activate
+# Linux/Mac
+source deepgan/bin/activate
 ```
 
-### 预测
-
-要使用经过训练的模型对图像进行着色，请运行 `predict.py` 脚本：
+3. 安装依赖：
 
 ```bash
-python predict.py --data <图像或目录路径> --model <生成器检查点路径>
+pip install -r requirements.txt
 ```
 
-*   `--data`: 要着色的图像或包含图像的目录的路径。使用 `0` 打开相机进行实时着色。
-*   `--model`: 生成器检查点文件的路径（例如，`runs/train(3)/generator/last.pt`）。
-*   `--batch_size`: 批次大小（默认值：16）。
-*   `--img_size`: 输入图像的大小（默认值：(256, 256)）。
-*   `--num_workers`: 数据加载器的工作线程数（默认值：0）。
-*   `--device`: 用于预测的设备（默认值：cuda）。
-*   `--save_path`: 用于保存着色图像的目录（默认值：runs/）。
+## 数据集准备
 
-示例：
+项目使用LOL数据集（Low-Light paired dataset）或类似的低光照/正常光照配对数据集。
+
+数据集结构应如下：
+```
+datasets/
+└── kitti_LOL/
+    ├── eval15/
+    │   ├── high/  # 测试集 - 正常光照图像
+    │   └── low/   # 测试集 - 低光照图像
+    └── our485/
+        ├── high/  # 训练集 - 正常光照图像
+        └── low/   # 训练集 - 低光照图像
+```
+
+您可以从[这里](https://daooshee.github.io/BMVC2018website/)下载LOL数据集，或使用自己的数据集（确保遵循相同的目录结构）。
+
+## 使用方法
+
+### 训练模型
+
+#### 标准GAN训练
 
 ```bash
-python predict.py --data test_image.png --model runs/train(3)/generator/last.pt
+python DeepTranserGAN.py --mode train --data datasets/kitti_LOL --save_path checkpoints --epochs 200 --batch_size 8 --lr 0.0002 --device cuda --optimizer adamw --loss bceblurwithlogitsloss --autocast True --grad_accum_steps 2
 ```
 
-要使用相机进行实时着色：
+#### WGAN-GP训练
 
 ```bash
-python predict.py --data 0 --model runs/train(3)/generator/last.pt
+python DeepTranserGAN.py --mode train_wgan --data datasets/kitti_LOL --save_path checkpoints --epochs 200 --batch_size 8 --lr 0.0002 --device cuda --optimizer adamw --autocast True --grad_accum_steps 2
 ```
 
-## 或者使用我训练好的模型以及处理过的视频进行预测
+### 参数说明
 
- 基于kitti数据集训练的模型下载链接：[https://cloud.189.cn/web/share?code=2yuIVbFreMjq](https://cloud.189.cn/web/share?code=2yuIVbFreMjq（访问码：rbr4）)
- 处理前视频：[https://cloud.189.cn/web/share?code=YJVnyqqYJBru](https://cloud.189.cn/web/share?code=YJVnyqqYJBru（访问码：8lkp）)
- 处理后视频：[https://cloud.189.cn/web/share?code=J3q2uyiMRJvi（访问码：lmw6）](https://cloud.189.cn/web/share?code=J3q2uyiMRJvi（访问码：lmw6）)
+- `--mode`: 运行模式 (`train`, `train_wgan`, `predict`)
+- `--data`: 数据集路径
+- `--save_path`: 模型保存路径
+- `--epochs`: 训练轮数
+- `--batch_size`: 批次大小
+- `--lr`: 学习率
+- `--device`: 使用设备 (`cuda` 或 `cpu`)
+- `--optimizer`: 优化器类型 (`adam`, `adamw`, `sgd`, `lion`, `rmp`)
+- `--loss`: 损失函数 (`bceblurwithlogitsloss`, `mse`, `focalloss`, `bce`)
+- `--autocast`: 是否使用混合精度训练 (`True` 或 `False`)
+- `--grad_accum_steps`: 梯度累积步数
+- `--patience`: 早停耐心值
+- `--resume`: 从检查点恢复训练
 
- ###  你可以使用我处理的视频，或者自己通过darker.py处理自己想要处理的数据集及视频
+### 图像增强预测
 
-### 数据集
-
-该项目使用 LOLdataset，其中包含低光照和正常光照图像对。`datasets/data_set.py` 中的 `LowLightDataset` 类处理加载和预处理数据。
-
-数据集目录应具有以下结构：
-
-```
-LOLdataset/
-    our485/
-        high/
-            *.png
-        low/
-            *.png
-    eval15/
-        high/
-            *.png
-        low/
-            *.png
+```bash
+python DeepTranserGAN.py --mode predict --data datasets/kitti_LOL/eval15 --model checkpoints/train/generator/best.pt --save_path results --device cuda
 ```
 
-### 模型
+### 视频增强预测
 
-着色过程的核心是生成器模型，在 `models/base_mode.py` 中定义。它使用 RepViT 块、SPPELAN、PSA 和其他自定义层来从灰度输入生成着色图像。判别器（或 WGAN 版本中的评论家）用于区分真实图像和生成图像，从而指导生成器产生更逼真的结果。
+```bash
+python DeepTranserGAN.py --mode predict --video True --data path/to/your/video.mp4 --model checkpoints/train/generator/best.pt --save_path results --save_video True --device cuda
+```
 
-## 使用 WGAN 进行训练
+## 训练技巧
 
-`engine.py` 文件还包括一个 `train_WGAN` 函数，用于使用 WGAN-GP（具有梯度惩罚的 Wasserstein GAN）方法训练模型。这可能会导致更稳定的训练和更好的结果。要使用它，您需要修改 `train.py` 脚本以调用 `train_WGAN` 而不是 `train`。
+1. **数据增强**: 默认启用了随机水平翻转、旋转和亮度变化，可以提高模型泛化能力。
+
+2. **学习率调度**: 使用余弦退火学习率调度，帮助模型更好地收敛。
+
+3. **梯度累积**: 对于内存受限的情况，可以增加`grad_accum_steps`来模拟更大的批次大小。
+
+4. **混合精度训练**: 启用`autocast`可以加速训练并减少内存使用。
+
+5. **早停机制**: 当验证性能不再提升时，训练会自动停止，避免过拟合。
+
+## 模型评估
+
+训练过程中，模型会定期在测试集上评估PSNR和SSIM指标。评估结果会记录在日志文件和TensorBoard中。
+
+查看TensorBoard日志：
+
+```bash
+tensorboard --logdir checkpoints/train
+```
+
+## 项目结构
+
+```
+DeepTranserGAN/
+├── DeepTranserGAN.py     # 主程序
+├── models/               # 模型定义
+│   ├── base_mode.py      # 基础网络架构
+│   ├── common.py         # 通用模块
+│   └── Repvit.py         # RepVit模块
+├── datasets/             # 数据集
+│   └── data_set.py       # 数据加载
+├── utils/                # 工具函数
+│   ├── loss.py           # 损失函数
+│   └── misic.py          # 杂项工具
+└── requirements.txt      # 依赖列表
+```
+
+## 常见问题
+
+1. **内存不足**: 
+   - 减小批次大小
+   - 增加梯度累积步数
+   - 启用混合精度训练
+
+2. **训练不稳定**:
+   - 尝试不同的学习率
+   - 调整判别器预训练次数
+   - 使用WGAN-GP代替标准GAN
+
+3. **生成图像质量差**:
+   - 增加训练轮数
+   - 调整感知损失权重
+   - 尝试不同的网络架构
+
+## 引用
+
+如果您在研究中使用了本项目，请引用：
+
+```
+@misc{DeepTranserGAN2025,
+  author = {黄小海},
+  title = {DeepTranserGAN: 低光照图像增强},
+  year = {2025},
+  publisher = {GitHub},
+  howpublished = {\url{https://github.com/yourusername/DeepTranserGAN}}
+}
+```
+
+## 许可证
+
+[MIT License](LICENSE)
+
+## 联系方式
+
+如有任何问题，请通过以下方式联系：
+
+- 邮箱: huangxiaohai99@126.com
+- GitHub Issues: [https://github.com/yourusername/DeepTranserGAN/issues](https://github.com/yourusername/DeepTranserGAN/issues)
