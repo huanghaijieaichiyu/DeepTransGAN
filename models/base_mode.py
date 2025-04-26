@@ -2,10 +2,8 @@ import math
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-import torchvision.models as models
-from torch.nn.utils import spectral_norm
 from models.Repvit import RepViTBlock
-from models.common import SPPELAN, Concat, Disconv, Gencov, PSA
+from models.common import EMA, SPPELAN, C2f, C2fCIB, Concat, Disconv, Gencov, PSA, Conv, CBAM, ADown, DilateBlock
 
 
 class BaseNetwork(nn.Module):
@@ -103,6 +101,111 @@ class Generator(BaseNetwork):
         return x9
 
 
+class AdvancedGenerator(BaseNetwork):
+    """
+    An advanced generator network with dilated attention and multi-scale feature fusion.
+    Input: [B, 3, 256, 256]
+    Output: [B, 3, 256, 256]
+    """
+
+    def __init__(self, depth=1):
+        super().__init__()
+        self.depth = depth
+        base_ch = 32  # Base number of channels
+
+        # Initial feature extraction
+        self.conv1 = nn.Sequential(
+            Gencov(3, base_ch, k=7),
+            # Use standard Conv from common.py
+        )
+
+        # Encoder blocks with dilated attention
+        self.enc2 = self._make_encoder_block(base_ch, base_ch * 2)
+        self.enc3 = self._make_encoder_block(base_ch * 2, base_ch * 4)
+        self.enc4 = self._make_encoder_block(base_ch * 4, base_ch * 8)
+
+        # Multi-scale feature processing
+        self.msf = nn.ModuleList([
+            SPPELAN(base_ch * 8, base_ch * 8, base_ch * 4)
+        ])
+
+        # PSA attention for feature enhancement
+        self.psa = PSA(base_ch * 8, base_ch * 8)
+
+        # Decoder blocks with advanced upsampling
+        self.dec3 = self._make_decoder_block(
+            base_ch * 16, base_ch * 4)  # Doubled input channels for skip
+        self.dec2 = self._make_decoder_block(
+            base_ch * 8, base_ch * 2)   # Doubled input channels for skip
+        self.dec1 = self._make_decoder_block(base_ch * 4, base_ch)
+
+        # Final refinement
+        self.refine = nn.Sequential(
+            Gencov(base_ch * 2, base_ch, k=3),
+            Gencov(base_ch, 3, k=7, bn=False, act=False),
+            nn.Sigmoid()
+        )
+
+    def _make_encoder_block(self, in_ch, out_ch):
+        """Enhanced encoder block with dilated convolutions and attention"""
+        return nn.Sequential(
+            Gencov(in_ch, out_ch * 2, k=3, s=2),
+            C2f(out_ch * 2, out_ch)  # Channel reduction
+        )
+
+    def _make_decoder_block(self, in_ch, out_ch):
+        """Enhanced decoder block with attention and residual connection"""
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            C2fCIB(in_ch, out_ch)
+        )
+
+    def _init_weights(self, m):
+        """Initialize weights for Conv2d, Linear, and BatchNorm2d layers"""
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='relu')
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.ones_(m.weight)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        # Input validation
+        assert x.shape[2:] == torch.Size(
+            [256, 256]), "Input size must be [B, 3, 256, 256]"
+
+        # Initial feature extraction
+        x1 = self.conv1(x)      # [B, 32, 256, 256]
+
+        # Encoder path with progressive feature learning
+        x2 = self.enc2(x1)     # [B, 64, 128, 128]
+        x3 = self.enc3(x2)     # [B, 128, 64, 64]
+        x4 = self.enc4(x3)     # [B, 256, 32, 32]
+
+        # Multi-scale feature processing
+        feat = x4
+        for msf_block in self.msf:
+            feat = msf_block(feat)
+
+        # Feature enhancement with PSA
+        feat = self.psa(feat)
+
+        # Decoder path with skip connections and feature fusion
+        d3 = self.dec3(torch.cat([feat, x4], 1))   # [B, 128, 64, 64]
+        d2 = self.dec2(torch.cat([d3, x3], 1))     # [B, 64, 128, 128]
+        d1 = self.dec1(torch.cat([d2, x2], 1))     # [B, 32, 256, 256]
+
+        # Final refinement with original features
+        out = self.refine(torch.cat([d1, x1], 1))  # [B, 3, 256, 256]
+
+        return out
+
+
 class Discriminator(BaseNetwork):
     """
     Discriminator model with no activation function
@@ -150,257 +253,3 @@ class Discriminator(BaseNetwork):
         x = self.fc(x)      # [B, 1]
         x = self.sigmoid(x)
         return x
-
-
-# 提取图像块的工具类
-class Patches(nn.Module):
-    def __init__(self, patch_size):
-        super().__init__()
-        self.patch_size = patch_size
-
-    def forward(self, images):
-        B, C, H, W = images.shape
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, "图像尺寸必须能被块大小整除"
-        # 提取图像块
-        patches = images.unfold(2, self.patch_size, self.patch_size).unfold(
-            3, self.patch_size, self.patch_size)
-        patches = patches.contiguous().view(B, C, -1, self.patch_size, self.patch_size)
-        patches = patches.permute(0, 2, 1, 3, 4).contiguous().view(
-            B, -1, C * self.patch_size * self.patch_size)
-        return patches
-
-# 修改后的双重裁剪自注意力模块，适配 ViT
-
-
-class DualPrunedSelfAttn(nn.Module):
-    def __init__(self, dim, num_heads, dim_head, height_top_k, width_top_k, dropout=0.):
-        super().__init__()
-        self.num_heads = num_heads  # 注意力头数
-        self.dim_head = dim_head    # 每个头的维度
-        self.scale = dim_head ** -0.5  # 缩放因子
-        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)  # Q、K、V 投影
-        self.to_out = nn.Linear(dim, dim)  # 输出投影
-        self.dropout = nn.Dropout(dropout)  # Dropout 层
-        self.height_top_k = height_top_k  # 高度方向裁剪的 top-k
-        self.width_top_k = width_top_k    # 宽度方向裁剪的 top-k
-
-    def prune_attn(self, attn, height_top_k, width_top_k):
-        B, H, N, _ = attn.shape
-        device = attn.device
-        # 动态调整 k，确保不超过 N
-        height_k = min(height_top_k, N)
-        width_k = min(width_top_k, N)
-
-        # 裁剪行
-        row_scores = attn.mean(dim=-1)  # 按列平均，形状 [B, H, N]
-        _, top_row_idx = row_scores.topk(height_k, dim=-1)
-        row_mask = torch.zeros(B, H, N, device=device)
-        row_mask.scatter_(-1, top_row_idx, 1)
-        row_mask = row_mask.unsqueeze(-1).expand(B, H, N, N)
-
-        # 裁剪列
-        col_scores = attn.mean(dim=-2)  # 按行平均，形状 [B, H, N]
-        _, top_col_idx = col_scores.topk(width_k, dim=-1)
-        col_mask = torch.zeros(B, H, N, device=device)
-        col_mask.scatter_(-1, top_col_idx, 1)
-        col_mask = col_mask.unsqueeze(-2).expand(B, H, N, N)
-
-        # 合并掩码
-        mask = row_mask * col_mask
-        return attn * mask
-
-    def forward(self, x):
-        B, N, C = x.size()  # 输入形状：[批次，块数，通道]
-        # 生成 Q、K、V
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: t.view(B, N, self.num_heads,
-                                       self.dim_head).transpose(1, 2), qkv)
-        # 计算注意力分数
-        attn = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-        # 应用裁剪
-        attn = self.prune_attn(attn, self.height_top_k, self.width_top_k)
-        # Softmax 和 Dropout
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        # 加权和
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, N, C)
-        out = self.to_out(out)
-        return out
-
-# ViT 风格的混合感知块
-
-
-class ViTHybridBlock(nn.Module):
-    def __init__(self, dim, num_heads, dim_head, height_top_k, width_top_k, ff_mult=4, dropout=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)  # 第一层归一化
-        self.attn = DualPrunedSelfAttn(
-            dim, num_heads, dim_head, height_top_k, width_top_k, dropout)
-        self.conv = nn.Conv2d(dim, dim, kernel_size=3,
-                              padding=1, groups=dim)  # 深度卷积
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)  # 第二层归一化
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * ff_mult),  # 前馈网络扩展
-            nn.GELU(),                      # GELU 激活
-            nn.Dropout(dropout),            # Dropout
-            nn.Linear(dim * ff_mult, dim)   # 前馈网络缩减
-        )
-
-    def forward(self, x):
-        B, N, C = x.size()  # 输入为块序列
-        # 注意力路径
-        x_attn = self.attn(self.norm1(x))
-        # 重塑为图像以进行卷积
-        H = W = int(N ** 0.5)  # 假设块网格为方形
-        x_conv = x.view(B, C, H, W)
-        x_conv = self.conv(x_conv)
-        x_conv = x_conv.view(B, N, C)
-        # 合并注意力与卷积结果
-        x = x_attn + x_conv
-        # 前馈路径
-        x = x + self.ff(self.norm2(x))
-        return x
-
-# 更新后的生成器，固定输入尺寸为 [B, 3, 256, 256]
-
-
-class SWTformerGenerator(nn.Module):
-    def __init__(self, depth=1, weight=1, patch_size=16, num_heads=8, height_top_k=64, width_top_k=64):
-        super().__init__()
-        self.depth = depth
-        self.weight = weight
-        self.patch_size = patch_size
-        self.img_size = (256, 256)  # 固定输入尺寸为 256x256
-
-        # ----------------------- 编码器 -----------------------
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, int(math.ceil(8 * depth)),
-                      kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(int(math.ceil(8 * depth))),
-            nn.SiLU(),
-            PSA(int(math.ceil(8 * depth)), int(math.ceil(8 * depth)))  # 增加PSA
-        )  # 256x256
-
-        self.conv2 = self._make_cnn_block(
-            int(math.ceil(8 * depth)), int(math.ceil(16 * depth)))  # 128x128
-        self.conv3 = self._make_cnn_block(
-            int(math.ceil(16 * depth)), int(math.ceil(32 * depth)))  # 64x64
-        self.conv4 = self._make_cnn_block(
-            int(math.ceil(32 * depth)), int(math.ceil(64 * depth)))  # 32x32
-
-        # 全局平均池化
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # ----------------------- Transformer -----------------------
-        dim = int(math.ceil(64 * depth))
-        self.patch_embed = nn.Linear(
-            patch_size * patch_size * dim + dim, dim)  # 融合全局信息
-        self.feat_h = 256 // 8  # 32
-        self.feat_w = 256 // 8  # 32
-        self.num_patches = (self.feat_h // patch_size) *\
-            (self.feat_w // patch_size)  # 4 (对于 patch_size=16)
-        self.pos_embed = nn.Parameter(torch.zeros(
-            1, self.num_patches, dim))  # [1, 4, dim]
-
-        self.transformer = nn.ModuleList([
-            ViTHybridBlock(dim, num_heads, dim // num_heads,
-                           height_top_k, width_top_k, ff_mult=4, dropout=0.1)
-            for _ in range(2)  # 两层 Transformer
-        ])
-
-        # ----------------------- 解码器 -----------------------
-        self.upconv6 = Disconv(
-            dim, int(math.ceil(32 * depth)))  # 32x32 -> 64x64
-        self.upconv7 = Disconv(int(math.ceil(32 * depth)),
-                               int(math.ceil(16 * depth)))  # 64x64 -> 128x128
-        self.upconv8 = Disconv(int(math.ceil(16 * depth)),
-                               int(math.ceil(8*depth)))  # 128x128 -> 256x256
-        self.conv9 = nn.Conv2d(int(math.ceil(8*depth)),
-                               3, kernel_size=3, padding=1)  # 最后一层卷积
-
-        self.sigmoid = nn.Sigmoid()  # 输出映射到 (0, 1)
-
-        # 跳跃连接的 1x1 卷积
-        self.skip_proj2 = nn.Conv2d(
-            int(math.ceil(8 * depth)), int(math.ceil(8 * depth)), kernel_size=1, padding=0)
-        self.skip_proj3 = nn.Conv2d(
-            int(math.ceil(16 * depth)), int(math.ceil(16 * depth)), kernel_size=1, padding=0)
-        self.skip_proj4 = nn.Conv2d(
-            int(math.ceil(32 * depth)), int(math.ceil(32 * depth)), kernel_size=1, padding=0)
-
-        # 初始化尺寸调整
-        self.adjust6 = nn.Conv2d(
-            dim // 2, int(math.ceil(32*depth)), kernel_size=1, padding=0)
-        self.adjust7 = nn.Conv2d(
-            int(math.ceil(16*depth)), int(math.ceil(16*depth)), kernel_size=1, padding=0)
-        self.adjust8 = nn.Conv2d(
-            int(math.ceil(8*depth)), int(math.ceil(8*depth)), kernel_size=1, padding=0)
-
-    def _make_cnn_block(self, in_channels, out_channels):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels,
-                      kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU(),
-            PSA(out_channels, out_channels)  # 增加PSA
-        )
-
-    def init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear, nn.ConvTranspose2d)):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        # 输入检查
-        assert x.shape[2:] == torch.Size(
-            [256, 256]), "输入尺寸必须为 [B, 3, 256, 256]"
-
-        # ----------------------- 编码器 -----------------------
-        x1 = self.conv1(x)  # 256x256 -> 256x256
-        x2 = self.conv2(x1)  # 256x256 -> 128x128
-        x3 = self.conv3(x2)  # 128x128 -> 64x64
-        x4 = self.conv4(x3)  # 64x64 -> 32x32
-
-        # 全局平均池化
-        global_feat = self.global_pool(x4)
-        global_feat = torch.flatten(global_feat, 1)  # [B, dim]
-
-        # ----------------------- Transformer -----------------------
-        patches = Patches(self.patch_size)(x4)  # 使用 Patches 提取图像块
-        x5 = torch.cat([patches, global_feat[:, None, :].expand(-1,
-                       patches.shape[1], -1)], dim=-1)  # 融合全局信息
-        x5 = self.patch_embed(x5) + self.pos_embed  # 融合位置编码
-        for block in self.transformer:
-            x5 = block(x5)
-
-        # 重塑回图像格式
-        B, N, C = x5.shape
-        x5 = x5.view(B, self.feat_h // self.patch_size,
-                     self.feat_w // self.patch_size, C).permute(0, 3, 1, 2)
-
-        # ----------------------- 解码器 -----------------------
-        skip2 = self.skip_proj2(x1)  # 256x256 -> 256x256
-        skip3 = self.skip_proj3(x2)  # 128x128 -> 128x128
-        skip4 = self.skip_proj4(x3)  # 64x64 -> 64x64
-
-        x6 = self.upconv6(x5)  # 32x32 -> 64x64
-        x6 = F.interpolate(
-            x6, size=skip4.shape[2:], mode='bilinear', align_corners=True)  # 插值到对应的大小
-        x6 = self.adjust6(x6) + skip4  # 添加skip链接
-
-        x7 = self.upconv7(x6)  # 64x64 -> 128x128
-        x7 = F.interpolate(
-            x7, size=skip3.shape[2:], mode='bilinear', align_corners=True)  # 插值到对应的大小
-        x7 = self.adjust7(x7) + skip3
-
-        x8 = self.upconv8(x7)  # 128x128 -> 256x256
-        x8 = F.interpolate(
-            x8, size=skip2.shape[2:], mode='bilinear', align_corners=True)
-        x8 = self.adjust8(x8) + skip2
-
-        x9 = self.conv9(x8)  # 调整到 256x256
-        x9 = self.sigmoid(x9)
-
-        return x9

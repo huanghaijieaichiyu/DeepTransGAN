@@ -14,7 +14,7 @@ __init__ = ['calc_same_pad', 'Conv2dSame', 'Mlp', 'DilateAttention', 'MultiDilat
 
 
 class Conv2dSame(torch.nn.Conv2d):
-    # 解决pytorch conv2d stride与padding=‘same’ 不能同时使用问题
+    # 解决pytorch conv2d stride与padding='same' 不能同时使用问题
     def calc_same_pad(self, i: int, k: int, s: int, d: int) -> int:
         return max((math.ceil(i / s) - 1) * s + (k - 1) * d + 1 - i, 0)
 
@@ -915,7 +915,8 @@ class C3x(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         self.c_ = int(c2 * e)
         self.m = nn.Sequential(
-            *(Bottleneck(self.c_, self.c_, shortcut, g, k=((1, 3), (3, 1)), e=1) for _ in range(n)))
+            *(Bottleneck(self.c_, self.c_, shortcut, g, k=((1, 3), (3, 1)), e=1) for _ in range(n))
+        )
 
 
 # SimAM
@@ -941,9 +942,8 @@ class SimAM(torch.nn.Module):
         n = w * h - 1
 
         x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
-        y = x_minus_mu_square / \
-            (4 * (x_minus_mu_square.sum(dim=[2, 3],
-                                        keepdim=True) / n + self.e_lambda)) + 0.5
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3],
+                                                            keepdim=True) / n + self.e_lambda)) + 0.5
 
         return x * self.activaton(y)
 
@@ -1211,10 +1211,8 @@ class Attention(nn.Module):
 
 
 class PSA(nn.Module):
-
     '''
     参照YOLOv10中PSA模块进行改进，源代码地址：
-
     '''
 
     def __init__(self, c1, c2, e=0.5):
@@ -1228,7 +1226,7 @@ class PSA(nn.Module):
 
         # 注意力分支
         self.attn = Attention(self.c, attn_ratio=0.5,
-                              num_heads=max(self.c // 32, 1))  # 动态调整 heads
+                              num_heads=max(1, self.c // 32))  # 动态调整 heads
 
         # FFN 分支：增强特征表达
         self.ffn = nn.Sequential(
@@ -1327,9 +1325,9 @@ class CBAM(nn.Module):
 class Disconv(nn.Module):
     """
     standard convolution for discriminator
-    act: activation function, default: SiLU
-    bias: bias for convolution, default: False
-    bn: batch normalization, default: True
+    act: activation function, default: LeakyReLU
+    bias: bias for convolution, default: True
+    norm: normalization layer, default: InstanceNorm2d
     c1: input channels
     c2: output channels
     k: kernel size
@@ -1338,14 +1336,43 @@ class Disconv(nn.Module):
     g: groups
     """
 
-    def __init__(self, c1, c2, k=3, s=1, d=1, g=1, act=True, bias=False, bn=True):
+    def __init__(self, c1, c2, k=3, s=1, d=1, g=1, p=None, act=True, bias=True, norm=True):
         super(Disconv, self).__init__()
-        self.conv = Conv2dSame(c1, c2, k, s, groups=g, dilation=d, bias=bias)
-        self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
-        self.act = nn.ReLU() if act else nn.Identity()
+        # 使用标准Conv2d替代Conv2dSame，提高数值稳定性
+        padding = k // 2  # 使用标准padding
+        self.conv = nn.Conv2d(c1, c2, k, s, padding=autopad(k, p, d),
+                              groups=g, dilation=d, bias=bias)
+
+        # 使用InstanceNorm2d替代BatchNorm2d，提高稳定性
+        self.norm = nn.InstanceNorm2d(
+            c2, affine=True) if norm else nn.Identity()
+
+        # 使用LeakyReLU替代ReLU，防止梯度消失
+        self.act = nn.LeakyReLU(0.2, inplace=False) if act else nn.Identity()
+
+        # 初始化权重，使用kaiming初始化
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # 使用kaiming_normal_初始化卷积权重
+        nn.init.kaiming_normal_(
+            self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
+        if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
+
+        # 如果使用InstanceNorm，初始化其参数
+        if isinstance(self.norm, nn.InstanceNorm2d):
+            if self.norm.weight is not None:
+                nn.init.constant_(self.norm.weight, 1.0)
+            if self.norm.bias is not None:
+                nn.init.constant_(self.norm.bias, 0.0)
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        # 前向传播，确保数值稳定性
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
 
 
 class Gencov(nn.Module):
@@ -1362,11 +1389,29 @@ class Gencov(nn.Module):
     g: groups
     """
 
-    def __init__(self, c1, c2, k=3, s=1, d=1, g=1, act=True, bias=False, bn=True):
-        super(Gencov, self).__init__()
-        self.conv = Conv2dSame(c1, c2, k, s, groups=g, dilation=d, bias=bias)
-        self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, bn=True, act=True):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(
+            k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.InstanceNorm2d(c2) if bn else nn.Identity()
         self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+        # 初始化权重，使用kaiming初始化
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # 使用kaiming_normal_初始化卷积权重
+        nn.init.kaiming_normal_(
+            self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
+        if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
+
+        # 如果使用InstanceNorm，初始化其参数
+        if isinstance(self.bn, nn.InstanceNorm2d):
+            if self.bn.weight is not None:
+                nn.init.constant_(self.bn.weight, 1.0)
+            if self.bn.bias is not None:
+                nn.init.constant_(self.bn.bias, 0.0)
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -1374,6 +1419,19 @@ class Gencov(nn.Module):
 
 class Conv_trans(nn.Module):
     """
+    Transposed convolution layer with optional batch normalization and activation.
+
+    Args:
+        c1 (int): Number of input channels
+        c2 (int): Number of output channels 
+        k (int): Kernel size. Default: 4
+        s (int): Stride. Default: 2
+        p (int): Padding. Default: 1
+        d (int): Dilation. Default: 1
+        g (int): Groups. Default: 1
+        act (bool): Whether to use activation. Default: True
+        bias (bool): Whether to use bias. Default: False
+        bn (bool): Whether to use batch normalization. Default: True
 
     """
 
