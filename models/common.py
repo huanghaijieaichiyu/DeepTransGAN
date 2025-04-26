@@ -15,6 +15,7 @@ __init__ = ['calc_same_pad', 'Conv2dSame', 'Mlp', 'DilateAttention', 'MultiDilat
 
 class Conv2dSame(torch.nn.Conv2d):
     # 解决pytorch conv2d stride与padding='same' 不能同时使用问题
+    # 解决pytorch conv2d stride与padding='same' 不能同时使用问题
     def calc_same_pad(self, i: int, k: int, s: int, d: int) -> int:
         return max((math.ceil(i / s) - 1) * s + (k - 1) * d + 1 - i, 0)
 
@@ -167,7 +168,8 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
     # Pad to 'same' shape outputs
     if d > 1:
         k = d * (k - 1) + 1 if isinstance(k,
-                                          int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
+                                          # actual kernel-size
+                                          int) else [d * (x - 1) + 1 for x in k]
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
@@ -917,26 +919,28 @@ class C3x(C3):
         self.m = nn.Sequential(
             *(Bottleneck(self.c_, self.c_, shortcut, g, k=((1, 3), (3, 1)), e=1) for _ in range(n))
         )
+           *(Bottleneck(self.c_, self.c_, shortcut, g, k=((1, 3), (3, 1)), e=1) for _ in range(n))
+        )
 
 
-# SimAM
-class SimAM(torch.nn.Module):
-    def __init__(self, channels=None, out_channels=None, e_lambda=1e-4):
+        # SimAM
+        class SimAM(torch.nn.Module):
+        def __init__(self, channels=None, out_channels=None, e_lambda=1e-4):
         super(SimAM, self).__init__()
 
         self.activaton = nn.Sigmoid()
         self.e_lambda = e_lambda
 
-    def __repr__(self):
+        def __repr__(self):
         s = self.__class__.__name__ + '('
         s += ('lambda=%f)' % self.e_lambda)
         return s
 
-    @staticmethod
-    def get_module_name():
+    @ staticmethod
+        def get_module_name():
         return "simam"
 
-    def forward(self, x):
+        def forward(self, x):
         b, c, h, w = x.size()
 
         n = w * h - 1
@@ -944,30 +948,32 @@ class SimAM(torch.nn.Module):
         x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
         y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3],
                                                             keepdim=True) / n + self.e_lambda)) + 0.5
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3],
+                                                            keepdim=True) / n + self.e_lambda)) + 0.5
 
         return x * self.activaton(y)
 
 
-class h_sigmoid(nn.Module):
-    def __init__(self, inplace=True):
+        class h_sigmoid(nn.Module):
+        def __init__(self, inplace=True):
         super(h_sigmoid, self).__init__()
         self.relu = nn.ReLU6(inplace=inplace)
 
-    def forward(self, x):
+        def forward(self, x):
         return self.relu(x + 3) / 6
 
 
-class h_swish(nn.Module):
-    def __init__(self, inplace=True):
+        class h_swish(nn.Module):
+        def __init__(self, inplace=True):
         super(h_swish, self).__init__()
         self.sigmoid = h_sigmoid(inplace=inplace)
 
-    def forward(self, x):
+        def forward(self, x):
         return x * self.sigmoid(x)
 
 
-class CA(nn.Module):
-    def __init__(self, inp, oup, reduction=32):
+        class CA(nn.Module):
+        def __init__(self, inp, oup, reduction=32):
         super(CA, self).__init__()
         self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
         self.pool_w = nn.AdaptiveAvgPool2d((1, None))
@@ -978,7 +984,7 @@ class CA(nn.Module):
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x):
+        def forward(self, x):
         identity = x
         n, c, h, w = x.size()
         # c*1*W
@@ -999,9 +1005,9 @@ class CA(nn.Module):
         return out
 
 
-def fuse_conv_and_bn(conv, bn):
-    """Fuse Conv2d() and BatchNorm2d() layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/."""
-    fusedconv = (
+        def fuse_conv_and_bn(conv, bn):
+        """Fuse Conv2d() and BatchNorm2d() layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/."""
+        fusedconv= (
         nn.Conv2d(
             conv.in_channels,
             conv.out_channels,
@@ -1016,25 +1022,27 @@ def fuse_conv_and_bn(conv, bn):
         .to(conv.weight.device)
     )
 
-    # Prepare filters
-    w_conv = conv.weight.clone().view(conv.out_channels, -1)
-    w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.shape))
+        # Prepare filters
+        w_conv= conv.weight.clone().view(conv.out_channels, -1)
+        w_bn= torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
+        fusedconv.weight.copy_(
+            torch.mm(w_bn, w_conv).view(fusedconv.weight.shape))
 
-    # Prepare spatial bias
-    b_conv = torch.zeros(
-        conv.weight.shape[0], device=conv.weight.device) if conv.bias is None else conv.bias
-    b_bn = bn.bias - \
-        bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-    fusedconv.bias.copy_(
+        # Prepare spatial bias
+        b_conv= torch.zeros(
+        conv.weight.shape[0], device = conv.weight.device) if conv.bias is None else conv.bias
+        b_bn = bn.bias -
+            bn.weight.mul(bn.running_mean).div(
+                torch.sqrt(bn.running_var + bn.eps))
+        fusedconv.bias.copy_(
         torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
-    return fusedconv
+        return fusedconv
 
 
-def fuse_deconv_and_bn(deconv, bn):
-    """Fuse ConvTranspose2d() and BatchNorm2d() layers."""
-    fuseddconv = (
+        def fuse_deconv_and_bn(deconv, bn):
+        """Fuse ConvTranspose2d() and BatchNorm2d() layers."""
+        fuseddconv= (
         nn.ConvTranspose2d(
             deconv.in_channels,
             deconv.out_channels,
@@ -1050,39 +1058,40 @@ def fuse_deconv_and_bn(deconv, bn):
         .to(deconv.weight.device)
     )
 
-    # Prepare filters
-    w_deconv = deconv.weight.clone().view(deconv.out_channels, -1)
-    w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-    fuseddconv.weight.copy_(
-        torch.mm(w_bn, w_deconv).view(fuseddconv.weight.shape))
+        # Prepare filters
+        w_deconv= deconv.weight.clone().view(deconv.out_channels, -1)
+        w_bn= torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
+        fuseddconv.weight.copy_(
+       torch.mm(w_bn, w_deconv).view(fuseddconv.weight.shape))
 
-    # Prepare spatial bias
-    b_conv = torch.zeros(
-        deconv.weight.shape[1], device=deconv.weight.device) if deconv.bias is None else deconv.bias
-    b_bn = bn.bias - \
-        bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-    fuseddconv.bias.copy_(
+        # Prepare spatial bias
+        b_conv= torch.zeros(
+        deconv.weight.shape[1], device = deconv.weight.device) if deconv.bias is None else deconv.bias
+        b_bn = bn.bias -
+            bn.weight.mul(bn.running_mean).div(
+                torch.sqrt(bn.running_var + bn.eps))
+        fuseddconv.bias.copy_(
         torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
-    return fuseddconv
+        return fuseddconv
 
 
-class RepVGGDW(torch.nn.Module):
-    def __init__(self, ed) -> None:
+        class RepVGGDW(torch.nn.Module):
+        def __init__(self, ed) -> None:
         super().__init__()
         self.conv = Conv(ed, ed, 7, 1, 3, g=ed, act=False)
         self.conv1 = Conv(ed, ed, 3, 1, 1, g=ed, act=False)
         self.dim = ed
         self.act = nn.SiLU()
 
-    def forward(self, x):
+        def forward(self, x):
         return self.act(self.conv(x) + self.conv1(x))
 
-    def forward_fuse(self, x):
+        def forward_fuse(self, x):
         return self.act(self.conv(x))
 
-    @torch.no_grad()
-    def fuse(self):
+    @ torch.no_grad()
+        def fuse(self):
         conv = fuse_conv_and_bn(self.conv.conv, self.conv.bn)
         conv1 = fuse_conv_and_bn(self.conv1.conv, self.conv1.bn)
 
@@ -1103,33 +1112,33 @@ class RepVGGDW(torch.nn.Module):
         del self.conv1
 
 
-class CIB(nn.Module):
-    """Standard bottleneck."""
+        class CIB(nn.Module):
+        """Standard bottleneck."""
 
-    def __init__(self, c1, c2, shortcut=True, e=0.5, lk=False):
+        def __init__(self, c1, c2, shortcut=True, e=0.5, lk=False):
         """Initializes a bottleneck module with given input/output channels, shortcut option, group, kernels, and
         expansion.
         """
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = nn.Sequential(
-            Conv(c1, c1, 3, g=c1),
+           Conv(c1, c1, 3, g=c1),
             Conv(c1, 2 * c_, 1),
             Conv(2 * c_, 2 * c_, 3, g=2 * c_) if not lk else RepVGGDW(2 * c_),
             Conv(2 * c_, c2, 1),
             Conv(c2, c2, 3, g=c2),
         )
 
-        self.add = shortcut and c1 == c2
+            self.add= shortcut and c1 == c2
 
-    def forward(self, x):
+        def forward(self, x):
         """'forward()' applies the YOLO FPN to input data."""
         return x + self.cv1(x) if self.add else self.cv1(x)
 
 
-# EMA
-class EMA(nn.Module):
-    def __init__(self, channels, factor=8):
+        # EMA
+        class EMA(nn.Module):
+        def __init__(self, channels, factor=8):
         super(EMA, self).__init__()
         self.groups = factor  # 分组因子
         assert channels // self.groups > 0
@@ -1138,13 +1147,13 @@ class EMA(nn.Module):
         self.pool_h = nn.AdaptiveAvgPool2d((None, 1))  # X平均池化层 h=1
         self.pool_w = nn.AdaptiveAvgPool2d((1, None))  # Y平均池化层 w=1
         self.gn = nn.GroupNorm(channels // self.groups,
-                               channels // self.groups)  # 分组操作
-        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1,
-                                 padding=0)  # 1×1卷积分支
-        self.conv3x3 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1,
-                                 padding=1)  # 3×3卷积分支
+                              channels // self.groups)  # 分组操作
+                               self.conv1x1= nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1,
+                                 padding = 0)  # 1×1卷积分支
+                                 self.conv3x3= nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1,
+                                 padding = 1)  # 3×3卷积分支
 
-    def forward(self, x):
+                                 def forward(self, x):
         b, c, h, w = x.size()
         group_x = x.reshape(b * self.groups, -1, h, w)  # b*g,c//g,h,w
         x_h = self.pool_h(group_x)  # 得到平均池化之后的h
@@ -1153,21 +1162,21 @@ class EMA(nn.Module):
         x_h, x_w = torch.split(hw, [h, w], dim=2)
         x1 = self.gn(group_x * x_h.sigmoid() *
                      x_w.permute(0, 1, 3, 2).sigmoid())
-        x2 = self.conv3x3(group_x)  # 3×3卷积分支
-        x11 = self.softmax(self.agp(x1).reshape(
+                     x2= self.conv3x3(group_x)  # 3×3卷积分支
+                     x11= self.softmax(self.agp(x1).reshape(
             b * self.groups, -1, 1).permute(0, 2, 1))
-        x12 = x2.reshape(b * self.groups, c //
-                         self.groups, -1)  # b*g, c//g, hw
-        x21 = self.softmax(self.agp(x2).reshape(
+                         x12= x2.reshape(b * self.groups, c //
+                        self.groups, -1)  # b*g, c//g, hw
+                         x21= self.softmax(self.agp(x2).reshape(
             b * self.groups, -1, 1).permute(0, 2, 1))
-        x22 = x1.reshape(b * self.groups, c //
+                             x22= x1.reshape(b * self.groups, c //
                          self.groups, -1)  # b*g, c//g, hw
-        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)
+                         weights= (torch.matmul(x11, x12) + torch.matmul(x21, x22)
                    ).reshape(b * self.groups, 1, h, w)
-        return (group_x * weights.sigmoid()).reshape(b, c, h, w)
+                   return (group_x * weights.sigmoid()).reshape(b, c, h, w)
 
 
-class C2fCIB(C2f):
+                       class C2fCIB(C2f):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=False, lk=False, g=1, e=0.5):
@@ -1175,156 +1184,160 @@ class C2fCIB(C2f):
         expansion.
         """
         super().__init__(c1, c2, n, shortcut, g, e)
-        self.m = nn.ModuleList(
+        self.m= nn.ModuleList(
             CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8,
-                 attn_ratio=0.5):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.key_dim = int(self.head_dim * attn_ratio)
-        self.scale = self.key_dim ** -0.5
-        nh_kd = nh_kd = self.key_dim * num_heads
-        h = dim + nh_kd * 2
-        self.qkv = Conv(dim, h, 1, act=False)
-        self.proj = Conv(dim, dim, 1, act=False)
-        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+            class Attention(nn.Module):
+            def __init__(self, dim, num_heads=8,
+                 attn_ratio =0.5):
+                 super().__init__()
+                     self.num_heads = num_heads
+                     self.head_dim = dim // num_heads
+                     self.key_dim = int(self.head_dim * attn_ratio)
+                     self.scale = self.key_dim ** -0.5
+                     nh_kd = nh_kd = self.key_dim * num_heads
+                     h = dim + nh_kd * 2
+                     self.qkv = Conv(dim, h, 1, act=False)
+                     self.proj = Conv(dim, dim, 1, act=False)
+                     self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
 
-    def forward(self, x):
-        B, _, H, W = x.shape
-        N = H * W
-        qkv = self.qkv(x)
-        q, k, v = qkv.view(
+                     def forward(self, x):
+        B, _, H, W= x.shape
+        N= H * W
+        qkv= self.qkv(x)
+        q, k, v= qkv.view(
             B, self.num_heads, -1, N).split([self.key_dim, self.key_dim, self.head_dim], dim=2)
 
-        attn = (
+            attn = (
             (q.transpose(-2, -1) @ k) * self.scale
         )
-        attn = attn.softmax(dim=-1)
-        x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W) + \
+            attn = attn.softmax(dim=-1)
+            x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W) + \
             self.pe(v.reshape(B, -1, H, W))
-        x = self.proj(x)
-        return x
+            x = self.proj(x)
+            return x
 
 
-class PSA(nn.Module):
-    '''
+        class PSA(nn.Module):
+        '''
     参照YOLOv10中PSA模块进行改进，源代码地址：
     '''
 
-    def __init__(self, c1, c2, e=0.5):
+        def __init__(self, c1, c2, e=0.5):
         super().__init__()
         assert c1 == c2, "输入和输出通道数必须相等"
-        self.c1 = c1
-        self.c = int(c1 * e)  # 减少的通道数用于注意力分支
+        self.c1= c1
+        self.c= int(c1 * e)  # 减少的通道数用于注意力分支
 
         # 输入卷积：拆分通道
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv1= Conv(c1, 2 * self.c, 1, 1)
 
         # 注意力分支
-        self.attn = Attention(self.c, attn_ratio=0.5,
-                              num_heads=max(1, self.c // 32))  # 动态调整 heads
+        self.attn= Attention(self.c, attn_ratio=0.5,
+                              num_heads =max(1, self.c // 32))  # 动态调整 heads
+            num_heads =max(1, self.c // 32))  # 动态调整 heads
 
-        # FFN 分支：增强特征表达
-        self.ffn = nn.Sequential(
+                                  # FFN 分支：增强特征表达
+                                  self.ffn = nn.Sequential(
             Conv(self.c, self.c * 2, 1),
             nn.GELU(),  # 使用 GELU 替代默认激活函数，提升非线性
             Conv(self.c * 2, self.c, 1, act=False)
-        )
+                                  )
 
-        # 输出卷积：融合分支
-        self.cv2 = Conv(2 * self.c, c1, 1)
+                                  # 输出卷积：融合分支
+                                  self.cv2 = Conv(2 * self.c, c1, 1)
 
-        # 残差连接的缩放因子
-        self.res_scale = nn.Parameter(torch.ones(1) * 0.1)  # 可学习的残差权重
+                                  # 残差连接的缩放因子
+                                  self.res_scale = nn.Parameter(torch.ones(1) * 0.1)  # 可学习的残差权重
 
-    def forward(self, x):
+                                  def forward(self, x):
         # 原始输入保留用于残差
-        identity = x
+        identity= x
 
         # 分割为两个分支
-        a, b = self.cv1(x).split((self.c, self.c), dim=1)  # a: 直通分支, b: 注意力分支
+        a, b= self.cv1(x).split((self.c, self.c), dim=1)  # a: 直通分支, b: 注意力分支
 
         # 注意力分支处理
-        b = b + self.attn(b)  # 残差连接
-        b = b + self.ffn(b)   # FFN 增强
+        b= b + self.attn(b)  # 残差连接
+        b= b + self.ffn(b)   # FFN 增强
 
         # 融合分支
-        out = self.cv2(torch.cat((a, b), dim=1))
+        out= self.cv2(torch.cat((a, b), dim=1))
 
         # 可学习的残差连接
         return out + self.res_scale * identity
 
 
-class SCDown(nn.Module):
+                                  class SCDown(nn.Module):
     def __init__(self, c1, c2, k, s):
         super().__init__()
-        self.cv1 = Conv(c1, c2, 1, 1)
-        self.cv2 = Conv(c2, c2, k=k, s=s, g=c2, act=False)
+        self.cv1= Conv(c1, c2, 1, 1)
+        self.cv2= Conv(c2, c2, k=k, s=s, g=c2, act=False)
 
     def forward(self, x):
         return self.cv2(self.cv1(x))
 
 
-# CBAM
-class ChannelAttention(nn.Module):
+                                  # CBAM
+                                  class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.f1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu = nn.ReLU()
-        self.f2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        self.avg_pool= nn.AdaptiveAvgPool2d(1)
+        self.max_pool= nn.AdaptiveMaxPool2d(1)
+        self.f1= nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu= nn.ReLU()
+        self.f2= nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid= nn.Sigmoid()
 
     def forward(self, x):
-        avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
-        max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
-        out = self.sigmoid(avg_out + max_out)
+        avg_out= self.f2(self.relu(self.f1(self.avg_pool(x))))
+        max_out= self.f2(self.relu(self.f1(self.max_pool(x))))
+        out= self.sigmoid(avg_out + max_out)
         return out
 
 
-class SpatialAttention(nn.Module):
+                                  class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
         assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
+        padding= 3 if kernel_size == 7 else 1
         # (特征图的大小-算子的size+2*padding)/步长+1
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        self.conv= nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid= nn.Sigmoid()
 
     def forward(self, x):
         # 1*h*w
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
+        avg_out= torch.mean(x, dim=1, keepdim=True)
+        max_out, _= torch.max(x, dim=1, keepdim=True)
+        x= torch.cat([avg_out, max_out], dim=1)
         # 2*h*w
-        x = self.conv(x)
+        x= self.conv(x)
         # 1*h*w
         return self.sigmoid(x)
 
 
-class CBAM(nn.Module):
+                                  class CBAM(nn.Module):
     # ch_in, ch_out, number, shortcut, groups, expansion
     def __init__(self, c1, c2, ratio=16, kernel_size=7):
         super(CBAM, self).__init__()
-        self.channel_attention = ChannelAttention(c1, ratio)
-        self.spatial_attention = SpatialAttention(kernel_size)
+        self.channel_attention= ChannelAttention(c1, ratio)
+        self.spatial_attention= SpatialAttention(kernel_size)
 
     def forward(self, x):
-        out = self.channel_attention(x) * x
+        out= self.channel_attention(x) * x
         # c*h*w
         # c*h*w * 1*h*w
-        out = self.spatial_attention(out) * out
+        out= self.spatial_attention(out) * out
         return out
 
 
-class Disconv(nn.Module):
+                                  class Disconv(nn.Module):
     """
     standard convolution for discriminator
+    act: activation function, default: LeakyReLU
+    bias: bias for convolution, default: True
+    norm: normalization layer, default: InstanceNorm2d
     act: activation function, default: LeakyReLU
     bias: bias for convolution, default: True
     norm: normalization layer, default: InstanceNorm2d
@@ -1337,18 +1350,47 @@ class Disconv(nn.Module):
     """
 
     def __init__(self, c1, c2, k=3, s=1, d=1, g=1, p=None, act=True, bias=True, norm=True):
+    def __init__(self, c1, c2, k=3, s=1, d=1, g=1, p=None, act=True, bias=True, norm=True):
         super(Disconv, self).__init__()
         # 使用标准Conv2d替代Conv2dSame，提高数值稳定性
-        padding = k // 2  # 使用标准padding
-        self.conv = nn.Conv2d(c1, c2, k, s, padding=autopad(k, p, d),
-                              groups=g, dilation=d, bias=bias)
+        padding= k // 2  # 使用标准padding
+        self.conv= nn.Conv2d(c1, c2, k, s, padding=autopad(k, p, d),
+                                  groups=g, dilation=d, bias=bias)
 
         # 使用InstanceNorm2d替代BatchNorm2d，提高稳定性
-        self.norm = nn.InstanceNorm2d(
+        self.norm= nn.InstanceNorm2d(
             c2, affine=True) if norm else nn.Identity()
 
         # 使用LeakyReLU替代ReLU，防止梯度消失
-        self.act = nn.LeakyReLU(0.2, inplace=False) if act else nn.Identity()
+        self.act= nn.LeakyReLU(0.2, inplace=False) if act else nn.Identity()
+
+        # 初始化权重，使用kaiming初始化
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # 使用kaiming_normal_初始化卷积权重
+        nn.init.kaiming_normal_(
+            self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
+        if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
+
+        # 如果使用InstanceNorm，初始化其参数
+        if isinstance(self.norm, nn.InstanceNorm2d):
+            if self.norm.weight is not None:
+                nn.init.constant_(self.norm.weight, 1.0)
+            if self.norm.bias is not None:
+                nn.init.constant_(self.norm.bias, 0.0)
+        # 使用标准Conv2d替代Conv2dSame，提高数值稳定性
+        padding= k // 2  # 使用标准padding
+        self.conv= nn.Conv2d(c1, c2, k, s, padding=autopad(k, p, d),
+                                  groups=g, dilation=d, bias=bias)
+
+        # 使用InstanceNorm2d替代BatchNorm2d，提高稳定性
+        self.norm= nn.InstanceNorm2d(
+            c2, affine=True) if norm else nn.Identity()
+
+        # 使用LeakyReLU替代ReLU，防止梯度消失
+        self.act= nn.LeakyReLU(0.2, inplace=False) if act else nn.Identity()
 
         # 初始化权重，使用kaiming初始化
         self._initialize_weights()
@@ -1369,13 +1411,18 @@ class Disconv(nn.Module):
 
     def forward(self, x):
         # 前向传播，确保数值稳定性
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
+        x= self.conv(x)
+        x= self.norm(x)
+        x= self.act(x)
+        return x
+        # 前向传播，确保数值稳定性
+        x= self.conv(x)
+        x= self.norm(x)
+        x= self.act(x)
         return x
 
 
-class Gencov(nn.Module):
+                                  class Gencov(nn.Module):
     """
     standard convolution for generator
     act: activation function, default: SiLU
@@ -1391,34 +1438,64 @@ class Gencov(nn.Module):
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, bn=True, act=True):
         super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(
-            k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = nn.InstanceNorm2d(c2) if bn else nn.Identity()
-        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+        self.conv= nn.Conv2d(c1, c2, k, s, autopad(
+            k, p, d), groups =g, dilation=d, bias=False)
+            self.bn = nn.InstanceNorm2d(c2) if bn else nn.Identity()
+            self.act = nn.SiLU(inplace=True) if act else nn.Identity()
 
-        # 初始化权重，使用kaiming初始化
-        self._initialize_weights()
+            # 初始化权重，使用kaiming初始化
+            self._initialize_weights()
 
-    def _initialize_weights(self):
-        # 使用kaiming_normal_初始化卷积权重
-        nn.init.kaiming_normal_(
+            def _initialize_weights(self):
+            # 使用kaiming_normal_初始化卷积权重
+            nn.init.kaiming_normal_(
             self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
-        if self.conv.bias is not None:
+            if self.conv.bias is not None:
             nn.init.constant_(self.conv.bias, 0)
 
-        # 如果使用InstanceNorm，初始化其参数
-        if isinstance(self.bn, nn.InstanceNorm2d):
+            # 如果使用InstanceNorm，初始化其参数
+            if isinstance(self.bn, nn.InstanceNorm2d):
             if self.bn.weight is not None:
-                nn.init.constant_(self.bn.weight, 1.0)
+            nn.init.constant_(self.bn.weight, 1.0)
             if self.bn.bias is not None:
-                nn.init.constant_(self.bn.bias, 0.0)
+            nn.init.constant_(self.bn.bias, 0.0)
 
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+            # 初始化权重，使用kaiming初始化
+            self._initialize_weights()
+
+            def _initialize_weights(self):
+            # 使用kaiming_normal_初始化卷积权重
+            nn.init.kaiming_normal_(
+            self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
+            if self.conv.bias is not None:
+            nn.init.constant_(self.conv.bias, 0)
+
+            # 如果使用InstanceNorm，初始化其参数
+            if isinstance(self.bn, nn.InstanceNorm2d):
+            if self.bn.weight is not None:
+            nn.init.constant_(self.bn.weight, 1.0)
+            if self.bn.bias is not None:
+            nn.init.constant_(self.bn.bias, 0.0)
+
+            def forward(self, x):
+            return self.act(self.bn(self.conv(x)))
 
 
-class Conv_trans(nn.Module):
-    """
+            class Conv_trans(nn.Module):
+            """
+    Transposed convolution layer with optional batch normalization and activation.
+
+    Args:
+        c1 (int): Number of input channels
+        c2 (int): Number of output channels 
+        k (int): Kernel size. Default: 4
+        s (int): Stride. Default: 2
+        p (int): Padding. Default: 1
+        d (int): Dilation. Default: 1
+        g (int): Groups. Default: 1
+        act (bool): Whether to use activation. Default: True
+        bias (bool): Whether to use bias. Default: False
+        bn (bool): Whether to use batch normalization. Default: True
     Transposed convolution layer with optional batch normalization and activation.
 
     Args:
@@ -1435,12 +1512,12 @@ class Conv_trans(nn.Module):
 
     """
 
-    def __init__(self, c1, c2, k=4, s=2, p=1, d=1, g=1, act=True, bias=False, bn=True):
-        super(Conv_trans, self).__init__()
-        self.conv = nn.ConvTranspose2d(
+            def __init__(self, c1, c2, k=4, s=2, p=1, d=1, g=1, act=True, bias=False, bn=True):
+            super(Conv_trans, self).__init__()
+            self.conv = nn.ConvTranspose2d(
             c1, c2, k, s, p, groups=g, dilation=d, bias=bias)
-        self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
-        self.act = nn.SiLU() if act else nn.Identity()
+            self.bn = nn.BatchNorm2d(c2) if bn else nn.Identity()
+            self.act = nn.SiLU() if act else nn.Identity()
 
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+            def forward(self, x):
+            return self.act(self.bn(self.conv(x)))

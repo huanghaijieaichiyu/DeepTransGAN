@@ -22,8 +22,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
+import torch.optim.rmsprop
 from torch.utils import tensorboard
 from torch.utils.data import DataLoader
 from torcheval.metrics.functional import peak_signal_noise_ratio
@@ -31,8 +31,7 @@ from torchvision import transforms
 from tqdm import tqdm  # 更新导入以使用新的autocast API
 
 from datasets.data_set import LowLightDataset
-from models.base_mode import Generator, Discriminator
-from models.efficient_generator import LightweightGenerator
+from models.base_mode import AdvancedGenerator, Generator, Discriminator
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
 
 
@@ -67,15 +66,14 @@ def spectral_norm(module, name='weight', power_iterations=1):
 
     return module
 
-
 # 添加 SpectralNormConv2d 类，用于替换判别器中的卷积层
 
 
 class SpectralNormConv2d(nn.Module):
-
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
+        self.conv = nn.Conv2d(in_channels, out_channels,
+                              kernel_size, stride, padding, bias=bias)
         self.conv = spectral_norm(self.conv)
 
     def forward(self, x):
@@ -84,7 +82,6 @@ class SpectralNormConv2d(nn.Module):
 
 # 添加自定义的Warmup余弦退火学习率调度器
 class WarmupCosineScheduler:
-
     def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6, warmup_start_lr=1e-7):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
@@ -132,13 +129,15 @@ class WarmupCosineScheduler:
 class BaseTrainer:
 
     def __init__(self, args, generator, discriminator=None, critic=None):
+        self.n_pretain = 2  # 减少判别器预训练次数，避免过度训练
         self.args = args
         self.generator = generator
         self.discriminator = discriminator
         self.critic = critic
         self.device = torch.device('cpu')
         if args.device == 'cuda':
-            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device(
+                'cuda:0' if torch.cuda.is_available() else 'cpu')
         self.generator = self.generator.to(self.device)
 
         # 初始化生成器权重
@@ -170,13 +169,10 @@ class BaseTrainer:
             #     (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # 标准化到 [-1, 1]
         ])
 
-        self.train_data = LowLightDataset(image_dir=args.data, transform=self.transform, phase="train")
-        self.train_loader = DataLoader(self.train_data,
-                                       batch_size=args.batch_size,
-                                       num_workers=args.num_workers,
-                                       shuffle=True,
-                                       drop_last=True,
-                                       pin_memory=True)  # 启用pin_memory加速数据传输
+        self.train_data = LowLightDataset(
+            image_dir=args.data, transform=self.transform, phase="train")
+        self.train_loader = DataLoader(self.train_data, batch_size=args.batch_size, num_workers=args.num_workers,
+                                       shuffle=True, drop_last=True, pin_memory=True)  # 启用pin_memory加速数据传输
 
         # 测试数据不需要增强，但需要标准化
         self.test_transform = transforms.Compose([
@@ -187,23 +183,26 @@ class BaseTrainer:
             #    (0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # 标准化到 [-1, 1]
         ])
 
-        self.test_data = LowLightDataset(image_dir=args.data, transform=self.test_transform, phase="test")
-        self.test_loader = DataLoader(self.test_data,
-                                      batch_size=args.batch_size,
-                                      num_workers=args.num_workers,
-                                      shuffle=False,
-                                      drop_last=False,
-                                      pin_memory=True)
+        self.test_data = LowLightDataset(
+            image_dir=args.data, transform=self.test_transform, phase="test")
+        self.test_loader = DataLoader(self.test_data, batch_size=args.batch_size, num_workers=args.num_workers,
+                                      shuffle=False, drop_last=False, pin_memory=True)
 
         # 优化器初始化 - 使用不同的学习率
-        self.g_optimizer, self.d_optimizer = get_opt(args, self.generator, self.discriminator)
-
-        self.g_loss = get_loss(args.loss).to(self.device) if args.loss else nn.MSELoss().to(self.device)
-        self.stable_loss = nn.L1Loss().to(self.device)
+        self.g_optimizer, _ = get_opt(
+            args, self.generator, self.discriminator)
+        self.d_optimizer = torch.optim.RMSprop(
+            self.discriminator.parameters(), lr=args.lr)
+        # 损失函数组合
+        self.g_loss = get_loss(args.loss).to(
+            self.device) if args.loss else nn.MSELoss().to(self.device)
+        self.stable_loss = nn.MSELoss().to(self.device)
 
         # 路径设置
-        self.path = save_path(args.save_path) if args.resume == '' else args.resume
-        self.log = tensorboard.writer.SummaryWriter(log_dir=self.path, filename_suffix=str(args.epochs), flush_secs=180)
+        self.path = save_path(
+            args.save_path) if args.resume == '' else args.resume
+        self.log = tensorboard.writer.SummaryWriter(log_dir=self.path, filename_suffix=str(args.epochs),
+                                                    flush_secs=180)
 
         # 模型保存策略
         self.best_psnr = 0.0
@@ -214,22 +213,27 @@ class BaseTrainer:
 
         # 学习率调度 - 使用Warmup和余弦退火
         warmup_epochs = int(args.epochs * 0.1)  # 使用总epochs的10%作为warmup
-        self.scheduler_g = WarmupCosineScheduler(optimizer=self.g_optimizer,
-                                                 warmup_epochs=warmup_epochs,
-                                                 total_epochs=args.epochs,
-                                                 min_lr=args.lr * 0.001,
-                                                 warmup_start_lr=args.lr * 0.0001)
+        self.scheduler_g = WarmupCosineScheduler(
+            optimizer=self.g_optimizer,
+            warmup_epochs=warmup_epochs,
+            total_epochs=args.epochs,
+            min_lr=args.lr * 0.001,
+            warmup_start_lr=args.lr * 0.0001
+        )
         if self.d_optimizer is not None:
-            self.scheduler_d = WarmupCosineScheduler(optimizer=self.d_optimizer,
-                                                     warmup_epochs=warmup_epochs,
-                                                     total_epochs=args.epochs,
-                                                     min_lr=args.lr * 0.001,
-                                                     warmup_start_lr=args.lr * 0.0001)
+            self.scheduler_d = WarmupCosineScheduler(
+                optimizer=self.d_optimizer,
+                warmup_epochs=warmup_epochs,
+                total_epochs=args.epochs,
+                min_lr=args.lr * 0.001,
+                warmup_start_lr=args.lr * 0.0001
+            )
         else:
             self.scheduler_d = None
 
         # 梯度累积步数
-        self.grad_accum_steps = args.grad_accum_steps if hasattr(args, 'grad_accum_steps') else 1
+        self.grad_accum_steps = args.grad_accum_steps if hasattr(
+            args, 'grad_accum_steps') else 1
 
         # 标签平滑参数
         self.label_smoothing = 0.1
@@ -243,11 +247,16 @@ class BaseTrainer:
         # 两时间尺度更新规则 (TTUR)
         self.d_updates_per_g = 2  # 每训练一次生成器，训练判别器的次数
 
+        # NaN检测和处理
+        self.nan_detected = False
+        self.nan_count = 0
+        self.max_nan_count = 5  # 连续NaN次数阈值
         # 确保路径存在
         if self.args.resume == '':
             os.makedirs(os.path.join(self.path, 'generator'), exist_ok=True)
             if self.discriminator is not None:
-                os.makedirs(os.path.join(self.path, 'discriminator'), exist_ok=True)
+                os.makedirs(os.path.join(
+                    self.path, 'discriminator'), exist_ok=True)
             if self.critic is not None:
                 os.makedirs(os.path.join(self.path, 'critic'), exist_ok=True)
 
@@ -272,7 +281,7 @@ class BaseTrainer:
             print("提示: 安装 rich 库可以获得更美观的训练显示效果 (pip install rich)")
 
         # 简化损失函数配置
-        self.pixel_loss_weight = 1.0  # 像素损失权重
+        self.pixel_loss_weight = 10.0  # 像素损失权重
 
         # 添加梯度缩放因子，防止梯度爆炸
         self.gradient_scale = 0.1
@@ -283,7 +292,7 @@ class BaseTrainer:
         self.lr_decay_counter = 0
 
         # 添加梯度裁剪值
-        self.grad_clip_discriminator = 2.0
+        self.grad_clip_discriminator = 0.5
         self.grad_clip_generator = 1.0
 
     def _log_training_config(self):
@@ -297,15 +306,19 @@ class BaseTrainer:
     def load_checkpoint(self):
         if self.args.resume != '':
             # 加载生成器
-            g_path_checkpoint = os.path.join(self.args.resume, 'generator/last.pt')
+            g_path_checkpoint = os.path.join(
+                self.args.resume, 'generator/last.pt')
             if os.path.exists(g_path_checkpoint):
                 try:
                     # First try loading with weights_only=True (safer)
-                    g_checkpoint = torch.load(g_path_checkpoint, map_location=self.device, weights_only=True)
+                    g_checkpoint = torch.load(
+                        g_path_checkpoint, map_location=self.device, weights_only=True)
                 except Exception as e:
-                    print("Warning: Failed to load with weights_only=True, attempting legacy loading...")
+                    print(
+                        "Warning: Failed to load with weights_only=True, attempting legacy loading...")
                     # If that fails, try the legacy loading method
-                    g_checkpoint = torch.load(g_path_checkpoint, map_location=self.device, weights_only=False)
+                    g_checkpoint = torch.load(
+                        g_path_checkpoint, map_location=self.device, weights_only=False)
 
                 self.generator.load_state_dict(g_checkpoint['net'])
                 self.g_optimizer.load_state_dict(g_checkpoint['optimizer'])
@@ -317,7 +330,8 @@ class BaseTrainer:
                 if 'scheduler' in g_checkpoint:
                     self.scheduler_g.load_state_dict(g_checkpoint['scheduler'])
             else:
-                raise FileNotFoundError(f"Generator checkpoint {g_path_checkpoint} not found.")
+                raise FileNotFoundError(
+                    f"Generator checkpoint {g_path_checkpoint} not found.")
 
             # 加载判别器或评论器
             d_path_checkpoint = os.path.join(
@@ -326,11 +340,14 @@ class BaseTrainer:
             if os.path.exists(d_path_checkpoint):
                 try:
                     # First try loading with weights_only=True (safer)
-                    d_checkpoint = torch.load(d_path_checkpoint, map_location=self.device, weights_only=True)
+                    d_checkpoint = torch.load(
+                        d_path_checkpoint, map_location=self.device, weights_only=True)
                 except Exception as e:
-                    print("Warning: Failed to load with weights_only=True, attempting legacy loading...")
+                    print(
+                        "Warning: Failed to load with weights_only=True, attempting legacy loading...")
                     # If that fails, try the legacy loading method
-                    d_checkpoint = torch.load(d_path_checkpoint, map_location=self.device, weights_only=False)
+                    d_checkpoint = torch.load(
+                        d_path_checkpoint, map_location=self.device, weights_only=False)
 
                 if self.discriminator:
                     self.discriminator.load_state_dict(d_checkpoint['net'])
@@ -339,9 +356,11 @@ class BaseTrainer:
                 if self.d_optimizer is not None:
                     self.d_optimizer.load_state_dict(d_checkpoint['optimizer'])
                     if 'scheduler' in d_checkpoint and self.scheduler_d is not None:
-                        self.scheduler_d.load_state_dict(d_checkpoint['scheduler'])
+                        self.scheduler_d.load_state_dict(
+                            d_checkpoint['scheduler'])
             else:
-                raise FileNotFoundError(f"Discriminator/Critic checkpoint {d_path_checkpoint} not found.")
+                raise FileNotFoundError(
+                    f"Discriminator/Critic checkpoint {d_path_checkpoint} not found.")
 
             print(f'Continuing training from epoch: {self.epoch + 1}')
             self.path = self.args.resume
@@ -349,7 +368,8 @@ class BaseTrainer:
 
     def save_checkpoint(self, is_best=False):
         """保存检查点，可选择是否为最佳模型"""
-        save_path = os.path.join(self.path, 'generator', 'best.pt' if is_best else 'last.pt')
+        save_path = os.path.join(
+            self.path, 'generator', 'best.pt' if is_best else 'last.pt')
 
         # 保存生成器
         g_checkpoint = {
@@ -363,8 +383,11 @@ class BaseTrainer:
         torch.save(g_checkpoint, save_path)
 
         # 保存判别器或评论器
-        d_save_path = os.path.join(self.path, 'discriminator' if self.discriminator else 'critic',
-                                   'best.pt' if is_best else 'last.pt')
+        d_save_path = os.path.join(
+            self.path,
+            'discriminator' if self.discriminator else 'critic',
+            'best.pt' if is_best else 'last.pt'
+        )
 
         d_net_state = None
         if self.discriminator is not None:
@@ -392,27 +415,33 @@ class BaseTrainer:
         train_log_txt_formatter = (
             '{time_str} \t [Epoch] \t {epoch:03d} \t [gLoss] \t {gloss_str} \t [dLoss] \t {dloss_str} \t {Dx_str} \t ['
             'Dgz0] \t {Dgz0_str} \t [Dgz1] \t {Dgz1_str}\n')
-        to_write = train_log_txt_formatter.format(time_str=time.strftime("%Y_%m_%d_%H:%M:%S"),
-                                                  epoch=epoch + 1,
-                                                  gloss_str=" ".join(["{:4f}".format(np.mean(gen_loss))]),
-                                                  dloss_str=" ".join(["{:4f}".format(np.mean(dis_loss))]),
-                                                  Dx_str=" ".join(["{:4f}".format(d_x)]),
-                                                  Dgz0_str=" ".join(["{:4f}".format(d_g_z1)]),
+        to_write = train_log_txt_formatter.format(time_str=time.strftime("%Y_%m_%d_%H:%M:%S"), epoch=epoch + 1,
+                                                  gloss_str=" ".join(
+                                                      ["{:4f}".format(np.mean(gen_loss))]),
+                                                  dloss_str=" ".join(
+                                                      ["{:4f}".format(np.mean(dis_loss))]),
+                                                  Dx_str=" ".join(
+                                                      ["{:4f}".format(d_x)]),
+                                                  Dgz0_str=" ".join(
+                                                      ["{:4f}".format(d_g_z1)]),
                                                   Dgz1_str=" ".join(["{:4f}".format(d_g_z2)]))
         with open(self.train_log, "a") as f:
             f.write(to_write)
 
     def visualize_results(self, epoch, gen_loss, dis_loss, high_images, low_images, fake):
         self.log.add_scalar('generation loss', np.mean(gen_loss), epoch + 1)
-        self.log.add_scalar('discrimination loss', np.mean(dis_loss), epoch + 1)
-        self.log.add_scalar('learning rate', self.g_optimizer.state_dict()['param_groups'][0]['lr'], epoch + 1)
+        self.log.add_scalar('discrimination loss',
+                            np.mean(dis_loss), epoch + 1)
+        self.log.add_scalar('learning rate', self.g_optimizer.state_dict()[
+                            'param_groups'][0]['lr'], epoch + 1)
         self.log.add_images('real', high_images, epoch + 1)
         self.log.add_images('input', low_images, epoch + 1)
         self.log.add_images('fake', fake, epoch + 1)
 
     def evaluate_model(self):
         with torch.no_grad():
-            self.log_message(f"Evaluating the generator model at epoch {self.epoch + 1}")
+            self.log_message(
+                f"Evaluating the generator model at epoch {self.epoch + 1}")
             self.generator.eval()
             if self.discriminator:
                 self.discriminator.eval()
@@ -431,7 +460,8 @@ class BaseTrainer:
 
                 # 计算SSIM和PSNR
                 ssim_value = ssim(fake_eval, high_images).item()
-                psnr_value = peak_signal_noise_ratio(fake_eval, high_images).item()
+                psnr_value = peak_signal_noise_ratio(
+                    fake_eval, high_images).item()
 
                 Ssim.append(ssim_value)
                 PSN.append(psnr_value)
@@ -444,23 +474,27 @@ class BaseTrainer:
             self.log.add_scalar('SSIM', avg_ssim, self.epoch + 1)
             self.log.add_scalar('PSNR', avg_psnr, self.epoch + 1)
 
-            self.log_message(f"Model SSIM: {avg_ssim:.4f}  PSNR: {avg_psnr:.4f}")
+            self.log_message(
+                f"Model SSIM: {avg_ssim:.4f}  PSNR: {avg_psnr:.4f}")
 
             # 检查是否为最佳模型
             is_best = False
             if avg_psnr > self.best_psnr:
-                self.log_message(f"New best PSNR: {avg_psnr:.4f} (previous: {self.best_psnr:.4f})")
+                self.log_message(
+                    f"New best PSNR: {avg_psnr:.4f} (previous: {self.best_psnr:.4f})")
                 self.best_psnr = avg_psnr
                 is_best = True
                 self.patience_counter = 0
             elif avg_ssim > self.best_ssim:
-                self.log_message(f"New best SSIM: {avg_ssim:.4f} (previous: {self.best_ssim:.4f})")
+                self.log_message(
+                    f"New best SSIM: {avg_ssim:.4f} (previous: {self.best_ssim:.4f})")
                 self.best_ssim = avg_ssim
                 is_best = True
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
-                self.log_message(f"No improvement. Patience: {self.patience_counter}/{self.patience}")
+                self.log_message(
+                    f"No improvement. Patience: {self.patience_counter}/{self.patience}")
 
             # 如果是最佳模型，保存检查点
             if is_best:
@@ -480,14 +514,16 @@ class BaseTrainer:
 
         from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 
-        return Progress(TextColumn("[bold blue]{task.description}"),
-                        BarColumn(bar_width=40),
-                        TaskProgressColumn(),
-                        TextColumn("•"),
-                        TimeElapsedColumn(),
-                        TextColumn("•"),
-                        TimeRemainingColumn(),
-                        expand=True)
+        return Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            expand=True
+        )
 
     def print_epoch_summary(self, epoch, gen_loss, dis_loss, metrics=None):
         """打印每个epoch结束时的训练摘要"""
@@ -501,7 +537,8 @@ class BaseTrainer:
             from rich.table import Table
 
             # 创建表格
-            table = Table(title=f"📊 训练摘要 - Epoch {epoch + 1}/{self.args.epochs}", expand=True)
+            table = Table(
+                title=f"📊 训练摘要 - Epoch {epoch + 1}/{self.args.epochs}", expand=True)
 
             # 添加列
             table.add_column("类别", style="cyan")
@@ -522,13 +559,17 @@ class BaseTrainer:
 
             # 添加其他指标
             for key, value in metrics.items():
-                table.add_row("指标", key, f"{value}" if isinstance(value, str) else f"{value:.4f}")
+                table.add_row("指标", key, f"{value}" if isinstance(
+                    value, str) else f"{value:.4f}")
 
             # 添加内存使用情况
             if torch.cuda.is_available():
-                table.add_row("GPU内存", "已分配", f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-                table.add_row("GPU内存", "缓存", f"{torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-                table.add_row("GPU内存", "最大分配", f"{torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+                table.add_row(
+                    "GPU内存", "已分配", f"{torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                table.add_row(
+                    "GPU内存", "缓存", f"{torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+                table.add_row(
+                    "GPU内存", "最大分配", f"{torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
 
             # 打印表格
             self.console.print()
@@ -566,9 +607,12 @@ class BaseTrainer:
             # 内存使用情况
             if torch.cuda.is_available():
                 print(f"💾 GPU 内存:")
-                print(f"   已分配: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-                print(f"   缓存: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-                print(f"   最大分配: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+                print(
+                    f"   已分配: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                print(
+                    f"   缓存: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+                print(
+                    f"   最大分配: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
 
             print(f"{separator}\n")
 
@@ -576,7 +620,8 @@ class BaseTrainer:
         raise NotImplementedError
 
     def train(self):
-        set_random_seed(self.args.seed, deterministic=self.args.deterministic, benchmark=self.args.benchmark)
+        set_random_seed(
+            self.args.seed, deterministic=self.args.deterministic, benchmark=self.args.benchmark)
         self.load_checkpoint()
 
         stop_training = False
@@ -630,7 +675,8 @@ class BaseTrainer:
         """初始化模型权重，使用Kaiming初始化"""
         for m in model.modules():
             if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm)):
@@ -659,6 +705,17 @@ class BaseTrainer:
             self.nan_detected = False
             self.nan_count = 0
             return False
+
+    def _check_gradients(self, model, model_name):
+        """检查梯度是否包含NaN值"""
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    self.log_message(
+                        f"警告: 检测到NaN/Inf梯度在{model_name}的{name}参数中")
+                    param.grad.data.zero_()  # 将NaN梯度置零
+                    return True
+        return False
 
 
 class StandardGANTrainer(BaseTrainer):
@@ -697,7 +754,8 @@ class StandardGANTrainer(BaseTrainer):
 
     def train_epoch(self):
         if self.discriminator is None:
-            self.log_message("Discriminator is not initialized. Cannot train GAN.")
+            self.log_message(
+                "Discriminator is not initialized. Cannot train GAN.")
             return
 
         self.discriminator.train()
@@ -713,16 +771,14 @@ class StandardGANTrainer(BaseTrainer):
         if hasattr(self, 'rich_available') and self.rich_available:
             progress = self.create_rich_progress()
             if progress is not None:
-                task_id = progress.add_task(f"[cyan]Epoch {self.epoch + 1}/{self.args.epochs}",
-                                            total=len(self.train_loader))
+                task_id = progress.add_task(
+                    f"[cyan]Epoch {self.epoch + 1}/{self.args.epochs}", total=len(self.train_loader))
                 progress.start()
         else:
             # 美化进度条
-            pbar = tqdm(enumerate(self.train_loader),
-                        total=len(self.train_loader),
+            pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                         bar_format='{l_bar}{bar:10}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                        colour='green',
-                        ncols=100)
+                        colour='green', ncols=100)
 
         # 梯度累积相关变量
         d_loss_accumulator = 0
@@ -744,7 +800,8 @@ class StandardGANTrainer(BaseTrainer):
                 # 训练判别器
                 for j in range(self.d_updates_per_g):  # 使用 TTUR
                     if self.d_optimizer is not None:
-                        self.d_optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+                        self.d_optimizer.zero_grad(
+                            set_to_none=True)  # 更高效的梯度清零
                     else:
                         continue  # 如果没有判别器优化器，跳过判别器训练
 
@@ -756,6 +813,10 @@ class StandardGANTrainer(BaseTrainer):
                     # 判别器对真图像的判断
                     real_inputs = self.discriminator(high_images)
 
+                    # 检查判别器输出是否包含NaN
+                    if torch.isnan(fake_inputs).any() or torch.isnan(real_inputs).any():
+                        self.log_message("警告: 判别器输出包含NaN值，跳过此批次")
+                        break
                     # 创建标签 - 使用标签平滑
                     real_label = torch.ones_like(fake_inputs, requires_grad=False) * (1 - self.label_smoothing) + \
                         torch.rand_like(fake_inputs) * self.label_smoothing
@@ -772,11 +833,34 @@ class StandardGANTrainer(BaseTrainer):
                     # 总判别器损失 - 简化版本
                     d_output = (d_real_output + d_fake_output) / 2.0
 
+                    # 添加梯度惩罚 - 使用改进的梯度惩罚函数
+                    if self.lambda_gp > 0:
+                        gp = compute_gradient_penalty(
+                            self.discriminator, high_images, fake, self.lambda_gp)
+                        d_output = d_output + gp
+
+                    # 检查损失值是否为NaN
+                    if self._check_nan_values(d_output, "判别器"):
+                        break
+
                     d_loss_accumulator += d_output.item()
 
-                    # 反向传播
-                    d_output.backward()
-                    self.d_optimizer.step()
+                # 反向传播
+                d_output.backward()
+                self.d_optimizer.step()
+
+                # 检查梯度是否包含NaN
+                if self.discriminator is not None:
+                    if self._check_gradients(self.discriminator, "判别器"):
+                        # 如果检测到NaN梯度，降低学习率
+                        self.lr_decay_counter += 1
+                        if self.lr_decay_counter >= self.lr_decay_patience and self.d_optimizer is not None:
+                            for param_group in self.d_optimizer.param_groups:
+                                param_group['lr'] *= self.lr_decay_factor
+                            self.log_message(
+                                f"降低判别器学习率至 {self.d_optimizer.param_groups[0]['lr']}")
+                            self.lr_decay_counter = 0
+                        break
 
                 # 训练生成器
                 self.g_optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
@@ -788,7 +872,8 @@ class StandardGANTrainer(BaseTrainer):
                 fake_inputs = self.discriminator(fake)
 
                 # 计算生成器损失 - 使用简化的损失计算函数
-                g_output = self.compute_generator_loss(fake_inputs, fake, high_images)
+                g_output = self.compute_generator_loss(
+                    fake_inputs, fake, high_images)
 
                 g_loss_accumulator += g_output.item()
 
@@ -798,10 +883,25 @@ class StandardGANTrainer(BaseTrainer):
                 g_output.backward()
                 self.g_optimizer.step()
 
+                # 检查梯度是否包含NaN
+                if self._check_gradients(self.generator, "生成器"):
+                    # 如果检测到NaN梯度，降低学习率
+                    self.lr_decay_counter += 1
+                    if self.lr_decay_counter >= self.lr_decay_patience and self.g_optimizer is not None:
+                        for param_group in self.g_optimizer.param_groups:
+                            param_group['lr'] *= self.lr_decay_factor
+                        self.log_message(
+                            f"降低生成器学习率至 {self.g_optimizer.param_groups[0]['lr']}")
+                        self.log_message(
+                            f"降低生成器学习率至 {self.g_optimizer.param_groups[0]['lr']}")
+                        self.lr_decay_counter = 0
+                    continue
+
                 # 梯度累积
                 if batch_count % self.grad_accum_steps == 0 or i == len(self.train_loader) - 1:
                     # 梯度裁剪，防止梯度爆炸
-                    torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.grad_clip_generator)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.generator.parameters(), self.grad_clip_generator)
                     # 记录损失
                     gen_loss.append(g_loss_accumulator / self.grad_accum_steps)
                     dis_loss.append(d_loss_accumulator / self.grad_accum_steps)
@@ -814,8 +914,7 @@ class StandardGANTrainer(BaseTrainer):
                 source_g.append(d_g_z2)
 
                 # 更新进度条描述
-                if hasattr(self,
-                           'rich_available') and self.rich_available and progress is not None and task_id is not None:
+                if hasattr(self, 'rich_available') and self.rich_available and progress is not None and task_id is not None:
                     epoch_info = f"Epoch: [{self.epoch + 1}/{self.args.epochs}]"
                     batch_info = f"Batch: [{i + 1}/{len(self.train_loader)}]"
                     loss_info = f"D: {d_output.item():.4f} | G: {g_output.item():.4f}"
@@ -829,9 +928,7 @@ class StandardGANTrainer(BaseTrainer):
                     lr_info = f"lr_G: {lr_g:.6f} | lr_D: {lr_d:.6f}"
 
                     progress.update(
-                        task_id,
-                        advance=1,
-                        description=f"[cyan]{epoch_info} | {batch_info} | {loss_info} | {metrics} | {lr_info}")
+                        task_id, advance=1, description=f"[cyan]{epoch_info} | {batch_info} | {loss_info} | {metrics} | {lr_info}")
                 else:
                     epoch_info = f"Epoch: [{self.epoch + 1}/{self.args.epochs}]"
                     batch_info = f"Batch: [{i + 1}/{len(self.train_loader)}]"
@@ -847,7 +944,8 @@ class StandardGANTrainer(BaseTrainer):
 
                     if 'pbar' in locals():
                         pbar.set_description(
-                            f"🔄 {epoch_info} | {batch_info} | 📉 {loss_info} | 📊 {metrics} | 🔍 {lr_info}")
+                            f"🔄 {epoch_info} | {batch_info} | 📉 {loss_info} | 📊 {metrics} | 🔍 {lr_info}"
+                        )
 
                 # 每个epoch结束时保存检查点，而不是每个batch
                 if i == len(self.train_loader) - 1:
@@ -863,11 +961,16 @@ class StandardGANTrainer(BaseTrainer):
         self.write_log(self.epoch, gen_loss, dis_loss, d_x, d_g_z1, d_g_z2)
 
         # 打印训练摘要
-        metrics = {"D(x)": d_x, "D(G(z))": d_g_z2, "PSNR": self.evaluate_model() if self.epoch % 5 == 0 else "未计算"}
+        metrics = {
+            "D(x)": d_x,
+            "D(G(z))": d_g_z2,
+            "PSNR": self.evaluate_model() if self.epoch % 5 == 0 else "未计算"
+        }
         self.print_epoch_summary(self.epoch, gen_loss, dis_loss, metrics)
 
         # 可视化结果
-        self.visualize_results(self.epoch, gen_loss, dis_loss, high_images, low_images, fake)
+        self.visualize_results(self.epoch, gen_loss,
+                               dis_loss, high_images, low_images, fake)
 
 
 class WGAN_GPTrainer(BaseTrainer):
@@ -892,17 +995,23 @@ class WGAN_GPTrainer(BaseTrainer):
         c_lr = args.lr * 2.0
 
         # 为生成器使用 Adam 优化器，较小的 beta 值
-        g_optimizer = torch.optim.Adam(self.generator.parameters(),
-                                       lr=g_lr,
-                                       betas=(0.5, 0.999),
-                                       weight_decay=args.weight_decay if hasattr(args, 'weight_decay') else 1e-5)
+        g_optimizer = torch.optim.Adam(
+            self.generator.parameters(),
+            lr=g_lr,
+            betas=(0.5, 0.999),
+            weight_decay=args.weight_decay if hasattr(
+                args, 'weight_decay') else 1e-5
+        )
 
         # 为评论器使用 RMSprop 优化器，更稳定
         c_optimizer = None
         if self.critic is not None:
-            c_optimizer = torch.optim.RMSprop(self.critic.parameters(),
-                                              lr=c_lr,
-                                              weight_decay=args.weight_decay if hasattr(args, 'weight_decay') else 1e-5)
+            c_optimizer = torch.optim.RMSprop(
+                self.critic.parameters(),
+                lr=c_lr,
+                weight_decay=args.weight_decay if hasattr(
+                    args, 'weight_decay') else 1e-5
+            )
 
         return c_optimizer, g_optimizer
 
@@ -937,20 +1046,19 @@ class WGAN_GPTrainer(BaseTrainer):
         batch_count = 0
 
         # 预先定义噪声系数以减少计算
-        noise_factor = self.args.noise_factor if hasattr(self.args, 'noise_factor') else 0.05
+        noise_factor = self.args.noise_factor if hasattr(
+            self.args, 'noise_factor') else 0.05
 
         # 初始化进度条
         if hasattr(self, 'rich_available') and self.rich_available:
             if progress is not None:
-                task_id = progress.add_task(f"[cyan]Epoch {self.epoch + 1}/{self.args.epochs}",
-                                            total=len(self.train_loader))
+                task_id = progress.add_task(
+                    f"[cyan]Epoch {self.epoch + 1}/{self.args.epochs}", total=len(self.train_loader))
                 progress.start()
         else:
-            pbar = tqdm(enumerate(self.train_loader),
-                        total=len(self.train_loader),
+            pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                         bar_format='{l_bar}{bar:10}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                        colour='blue',
-                        ncols=100)
+                        colour='blue', ncols=100)
 
         # 将模型设置为训练模式
         self.generator.train()
@@ -980,6 +1088,10 @@ class WGAN_GPTrainer(BaseTrainer):
                         with torch.no_grad():
                             fake_images = self.generator(low_images)
 
+                        # 快速检查是否有NaN值并跳过
+                        if torch.isnan(fake_images).any():
+                            continue
+
                         # 为真假图像增加噪声（批量处理）
                         real_with_noise = high_images + \
                             torch.randn_like(high_images) * noise_factor
@@ -989,10 +1101,22 @@ class WGAN_GPTrainer(BaseTrainer):
                         critic_real = self.critic(real_with_noise)
                         critic_fake = self.critic(fake_with_noise)
 
+                        # 如果输出包含NaN，跳过此次迭代
+                        if torch.isnan(critic_real).any() or torch.isnan(critic_fake).any():
+                            continue
+
                         # 计算Wasserstein距离和梯度惩罚
-                        wasserstein_distance = torch.mean(critic_real) - torch.mean(critic_fake)
-                        gradient_penalty = compute_gradient_penalty(self.critic, real_with_noise, fake_with_noise,
+                        wasserstein_distance = torch.mean(
+                            critic_real) - torch.mean(critic_fake)
+                        gradient_penalty = compute_gradient_penalty(self.critic,
+                                                                    real_with_noise,
+                                                                    fake_with_noise,
                                                                     self.lambda_gp)
+
+                        # 如果梯度惩罚为NaN，使用零惩罚
+                        if torch.isnan(gradient_penalty).any():
+                            gradient_penalty = torch.tensor(
+                                0.0, device=self.device, requires_grad=True)
 
                         # 计算总critic损失
                         loss_critic = -wasserstein_distance + self.lambda_gp * gradient_penalty
@@ -1005,10 +1129,10 @@ class WGAN_GPTrainer(BaseTrainer):
                     critic_loss.append(critic_loss_batch)
 
                     # 应用梯度裁剪并更新参数
-                    if (j == self.d_updates_per_g - 1) and (batch_count % self.grad_accum_steps == 0
-                                                            or i == len(self.train_loader) - 1):
+                    if (j == self.d_updates_per_g - 1) and (batch_count % self.grad_accum_steps == 0 or i == len(self.train_loader) - 1):
                         scaler_c.unscale_(self.c_optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.critic.parameters(), 1.0)
                         scaler_c.step(self.c_optimizer)
                         scaler_c.update()
 
@@ -1021,6 +1145,10 @@ class WGAN_GPTrainer(BaseTrainer):
             with autocast(enabled=self.args.autocast):
                 # 生成假图像
                 fake_images = self.generator(low_images)
+
+                # 检查输出是否有NaN值
+                if torch.isnan(fake_images).any():
+                    continue
 
                 # 计算生成器损失
                 if self.critic is not None:
@@ -1043,9 +1171,9 @@ class WGAN_GPTrainer(BaseTrainer):
                     loss_generator = loss_generator + self.content_weight * content_loss
 
                 # 添加感知损失，如果启用
-                if hasattr(self, 'perception_weight') and self.perception_weight > 0 and hasattr(
-                        self, 'perceptual_loss'):
-                    perceptual_loss = self.perceptual_loss(fake_images, high_images)
+                if hasattr(self, 'perception_weight') and self.perception_weight > 0 and hasattr(self, 'perceptual_loss'):
+                    perceptual_loss = self.perceptual_loss(
+                        fake_images, high_images)
                     loss_generator = loss_generator + self.perception_weight * perceptual_loss
 
             # 使用scaler处理反向传播
@@ -1058,7 +1186,8 @@ class WGAN_GPTrainer(BaseTrainer):
             if batch_count % self.grad_accum_steps == 0 or i == len(self.train_loader) - 1:
                 # 梯度裁剪
                 scaler_g.unscale_(self.g_optimizer)
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(
+                    self.generator.parameters(), 5.0)
                 scaler_g.step(self.g_optimizer)
                 scaler_g.update()
 
@@ -1079,7 +1208,8 @@ class WGAN_GPTrainer(BaseTrainer):
 
                 # 获取最新损失
                 g_loss_display = gen_loss[-1]
-                c_loss_display = critic_loss[-1] if len(critic_loss) > 0 else 0.0
+                c_loss_display = critic_loss[-1] if len(
+                    critic_loss) > 0 else 0.0
 
                 loss_info = f"C: {c_loss_display:.4f} | G: {g_loss_display:.4f}"
                 metrics = f"G(z): {g_z_value:.3f}"
@@ -1090,14 +1220,12 @@ class WGAN_GPTrainer(BaseTrainer):
                 lr_info = f"lr_G: {lr_g:.6f} | lr_C: {lr_c:.6f}"
 
                 # 更新Rich进度条或tqdm进度条
-                if hasattr(self,
-                           'rich_available') and self.rich_available and progress is not None and task_id is not None:
-                    progress.update(
-                        task_id,
-                        advance=1,
-                        description=f"[cyan]{epoch_info} | {batch_info} | {loss_info} | {metrics} | {lr_info}")
+                if hasattr(self, 'rich_available') and self.rich_available and progress is not None and task_id is not None:
+                    progress.update(task_id, advance=1,
+                                    description=f"[cyan]{epoch_info} | {batch_info} | {loss_info} | {metrics} | {lr_info}")
                 elif 'pbar' in locals():
-                    pbar.set_description(f"🔄 {epoch_info} | {batch_info} | 📉 {loss_info} | 📊 {metrics} | 🔍 {lr_info}")
+                    pbar.set_description(
+                        f"🔄 {epoch_info} | {batch_info} | 📉 {loss_info} | 📊 {metrics} | 🔍 {lr_info}")
 
         # 关闭进度条
         if hasattr(self, 'rich_available') and self.rich_available and progress is not None:
@@ -1116,13 +1244,14 @@ class WGAN_GPTrainer(BaseTrainer):
         self.save_checkpoint()
 
         # 可视化结果（使用最后一个批次的图像）
-        self.visualize_results(self.epoch, gen_loss, critic_loss, high_images, low_images, fake_images)
+        self.visualize_results(
+            self.epoch, gen_loss, critic_loss, high_images, low_images, fake_images)
 
         return avg_gen_loss, avg_critic_loss
 
 
 def train(args):
-    generator = LightweightGenerator()
+    generator = AdvancedGenerator()
     discriminator = Discriminator()
     model_structure(generator, (3, 256, 256))
     model_structure(discriminator, (3, 256, 256))
@@ -1159,21 +1288,26 @@ class BasePredictor:
         self.args = args
         self.device = torch.device('cpu')
         if args.device == 'cuda':
-            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device(
+                'cuda:0' if torch.cuda.is_available() else 'cpu')
         self.data = args.data
         self.model = args.model
         self.batch_size = args.batch_size
         self.num_workers = args.num_workers
         self.save_path = args.save_path
         self.generator = Generator(1, 1)
-        model_structure(self.generator, (3, 256, 256))
+        model_structure(
+            self.generator, (3, 256, 256))
         try:
             # First try loading with weights_only=True (safer)
-            checkpoint = torch.load(self.model, map_location=self.device, weights_only=True)
+            checkpoint = torch.load(
+                self.model, map_location=self.device, weights_only=True)
         except Exception as e:
-            print("Warning: Failed to load with weights_only=True, attempting legacy loading...")
+            print(
+                "Warning: Failed to load with weights_only=True, attempting legacy loading...")
             # If that fails, try the legacy loading method
-            checkpoint = torch.load(self.model, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(
+                self.model, map_location=self.device, weights_only=False)
 
         self.generator.load_state_dict(checkpoint['net'])
         self.generator.to(self.device)
@@ -1196,7 +1330,8 @@ class ImagePredictor(BasePredictor):
 
     def __init__(self, args):
         super().__init__(args)
-        self.test_data = LowLightDataset(image_dir=self.data, transform=self.transform, phase="test")
+        self.test_data = LowLightDataset(
+            image_dir=self.data, transform=self.transform, phase="test")
         self.test_loader = DataLoader(self.test_data,
                                       batch_size=self.batch_size,
                                       num_workers=self.num_workers,
@@ -1224,7 +1359,8 @@ class ImagePredictor(BasePredictor):
                 fake_img = np.array(img_pil(fake[j]), dtype=np.float32)
 
                 if i > 10 and i % 10 == 0:  # 图片太多，十轮保存一次
-                    img_save_path = os.path.join(path, 'predictions', str(i) + '.jpg')
+                    img_save_path = os.path.join(
+                        path, 'predictions', str(i) + '.jpg')
                     cv2.imwrite(img_save_path, fake_img)
                 i = i + 1
             pbar.set_description('Processed %d images' % i)
@@ -1260,7 +1396,8 @@ class VideoPredictor(BasePredictor):
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-            print(f"Video properties: {width}x{height}, {fps} FPS, {total_frames} frames")
+            print(
+                f"Video properties: {width}x{height}, {fps} FPS, {total_frames} frames")
         except Exception as e:
             print(f"Error opening video: {e}")
             return  # 退出函数
@@ -1272,7 +1409,8 @@ class VideoPredictor(BasePredictor):
             try:
                 # 使用OpenCV的VideoWriter
                 # 使用整数形式的fourcc代码，避免使用VideoWriter_fourcc
-                fourcc = int(cv2.VideoWriter.fourcc('M', 'P', '4', 'V'))  # MP4V编码
+                fourcc = int(cv2.VideoWriter.fourcc(
+                    'M', 'P', '4', 'V'))  # MP4V编码
                 writer = cv2.VideoWriter(output_path, fourcc, fps, (640, 480))
 
                 if not writer.isOpened():
@@ -1301,17 +1439,21 @@ class VideoPredictor(BasePredictor):
                     # 视频帧处理
                     frame_resized = cv2.resize(frame, (640, 480))
                     frame_pil = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-                    frame_tensor = torch.tensor(np.array(frame_pil, np.float32) / 255.,
-                                                dtype=torch.float32).to(self.device)
-                    frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, 3, 480, 640]
+                    frame_tensor = torch.tensor(np.array(
+                        frame_pil, np.float32) / 255., dtype=torch.float32).to(self.device)
+                    frame_tensor = frame_tensor.permute(
+                        2, 0, 1).unsqueeze(0)  # [1, 3, 480, 640]
 
                     # 生成增强图像
                     fake = self.generator(frame_tensor)
-                    fake_np = fake.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
+                    fake_np = fake.squeeze(0).permute(
+                        1, 2, 0).cpu().detach().numpy()
 
                     # 转换为显示格式
-                    fake_display = (np.clip(fake_np, 0, 1) * 255).astype(np.uint8)
-                    fake_display_bgr = cv2.cvtColor(fake_display, cv2.COLOR_RGB2BGR)
+                    fake_display = (np.clip(fake_np, 0, 1)
+                                    * 255).astype(np.uint8)
+                    fake_display_bgr = cv2.cvtColor(
+                        fake_display, cv2.COLOR_RGB2BGR)
 
                     # 显示帧
                     cv2.imshow('Enhanced', fake_display_bgr)
@@ -1323,7 +1465,8 @@ class VideoPredictor(BasePredictor):
 
                     # 每10帧保存一张图片
                     if frame_count % 10 == 0:
-                        img_save_path = os.path.join(self.save_path, 'predictions', f'frame_{frame_count:04d}.jpg')
+                        img_save_path = os.path.join(
+                            self.save_path, 'predictions', f'frame_{frame_count:04d}.jpg')
                         cv2.imwrite(img_save_path, fake_display_bgr)
 
                     # 检查按键
@@ -1363,6 +1506,10 @@ def predict(args):
 
 def compute_gradient_penalty(critic, real_samples, fake_samples, lambda_gp=10.0):
     """计算WGAN-GP的梯度惩罚 - 优化版本，增加数值稳定性和效率"""
+    # 简单检查输入是否有NaN值
+    if torch.isnan(real_samples).any() or torch.isnan(fake_samples).any():
+        return torch.tensor(0.0, device=real_samples.device, requires_grad=True)
+
     batch_size = real_samples.size(0)
     device = real_samples.device
 
@@ -1374,75 +1521,36 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, lambda_gp=10.0)
     interpolates.requires_grad_(True)
 
     # 评估评论器在插值点的输出
-    critic_interpolates = critic(interpolates)
+    try:
+        critic_interpolates = critic(interpolates)
+    except RuntimeError:
+        # 如果评论器评估失败，返回零惩罚
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
     # 计算相对于插值点的梯度
-    gradients = torch.autograd.grad(outputs=critic_interpolates,
-                                    inputs=interpolates,
-                                    grad_outputs=torch.ones_like(critic_interpolates, device=device),
-                                    create_graph=True,
-                                    retain_graph=True,
-                                    only_inputs=True)[0]
+    try:
+        gradients = torch.autograd.grad(
+            outputs=critic_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(critic_interpolates, device=device),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+    except RuntimeError:
+        # 如果梯度计算失败，返回零惩罚
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # 检查梯度是否包含NaN/Inf
+    if torch.isnan(gradients).any() or torch.isinf(gradients).any():
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
     # 展平并计算梯度的L2范数
     gradients = gradients.view(batch_size, -1)
-    gradient_norm = torch.sqrt(torch.sum(gradients**2, dim=1) + 1e-8)  # 添加小值以防止除零
+    gradient_norm = torch.sqrt(
+        torch.sum(gradients ** 2, dim=1) + 1e-8)  # 添加小值以防止除零
 
     # 计算梯度惩罚：(||∇D(x̃)||₂ - 1)²
-    gradient_penalty = ((gradient_norm - 1)**2).mean() * lambda_gp
+    gradient_penalty = ((gradient_norm - 1) ** 2).mean() * lambda_gp
 
     return gradient_penalty
-
-
-# Update the "if __name__ == '__main__':" section to include CUT and FastCUT options
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, default='runs/cut', help='path')
-    parser.add_argument('--mode',
-                        type=str,
-                        default='cut',
-                        choices=['gan', 'wgan', 'cut', 'fastcut', 'predict'],
-                        help='训练或预测模式选择: gan, wgan, cut, fastcut, predict')
-    parser.add_argument('--model-type',
-                        type=str,
-                        default='cut',
-                        choices=['gen', 'lightweight', 'advanced', 'cut', 'fastcut'],
-                        help='模型类型: gen (标准生成器), lightweight (轻量级), advanced (高级), cut, fastcut')
-    parser.add_argument('--data', default='../datasets/kitti_LOL', type=str, help='数据集根目录')
-    parser.add_argument('--epochs', type=int, default=500, help='训练轮数')
-    parser.add_argument('--batch-size', type=int, default=8, help='批次大小')
-    parser.add_argument('--device', default='cuda', help='cuda设备, 例如 0 或 0,1,2,3 或 cpu')
-    parser.add_argument('--lr', type=float, default=3.5e-4, help='学习率')
-    parser.add_argument('--beta1', type=float, default=0.5, help='Adam优化器beta1')
-    parser.add_argument('--beta2', type=float, default=0.999, help='Adam优化器beta2')
-    parser.add_argument('--loss', type=str, default='MSELoss', help='损失函数类型')
-    parser.add_argument('--save-path', type=str, default='./runs/', help='模型保存路径')
-    parser.add_argument('--patience', type=int, default=20, help='早停耐心值')
-    parser.add_argument('--resume', type=str, default='', help='恢复训练: runs/exp/last.pt')
-    parser.add_argument('--seed', type=int, default=42, help='随机种子')
-    parser.add_argument('--deterministic', action='store_true', help='启用确定性模式')
-    parser.add_argument('--benchmark', action='store_true', help='启用cudnn基准测试')
-    parser.add_argument('--num-workers', type=int, default=0, help='dataloader工作线程数')
-    parser.add_argument('--perceptual-weight', type=float, default=0.0, help='感知损失权重，设为0禁用')
-    parser.add_argument('--identity-weight', type=float, default=0.0, help='身份损失权重，设为0禁用')
-    parser.add_argument('--content-weight', type=float, default=0.0, help='内容损失权重，设为0禁用')
-    parser.add_argument('--style-weight', type=float, default=0.0, help='风格损失权重，设为0禁用')
-    parser.add_argument('--nce-temp', type=float, default=0.07, help='CUT/FastCUT NCE温度系数')
-    parser.add_argument('--nce-weight', type=float, default=1.0, help='CUT/FastCUT NCE损失权重')
-
-    args = parser.parse_args()
-    set_random_seed(args.seed, args.deterministic, args.benchmark)
-
-    if args.mode == 'predict':
-        predict(args)
-    else:
-        # Select appropriate training function based on mode and model type
-        if args.mode == 'gan':
-            train(args)
-        elif args.mode == 'wgan':
-            train_WGAN(args)
-        elif args.mode == 'cut':
-            train_CUT(args)
-        elif args.mode == 'fastcut':
-            train_FastCUT(args)

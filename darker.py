@@ -46,24 +46,14 @@ class Darker:
                 )
 
     @staticmethod
-    def adjust_image(img: np.ndarray, ratio: float) -> np.ndarray:
-        """Apply darkening effect to the input image.
-
-        Args:
-            img: Input image in BGR format.
-            ratio: Brightness reduction ratio.
-
-        Returns:
-            Darkened image in BGR format.
+    def adjust_image(img, ratio):
         """
-        if img is None:
-            raise ValueError("Input image cannot be None")
-
+        对传入的图像执行暗化处理
+        """
         seed = random.uniform(0.5, 1)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        hsv = hsv.astype(np.float32)
-        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * ratio * seed, 0, 255)
-        hsv = hsv.astype(np.uint8)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2].astype(
+            np.float32) * ratio * seed, 0, 255)
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     def process_images(self) -> None:
