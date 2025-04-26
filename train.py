@@ -12,11 +12,14 @@ def args():
     parser.add_argument("--batch_size", type=int, default=16,
                         help="size of the batches")  # 降低batch_size以适应复杂模型
     parser.add_argument("--optimizer", type=str, default='Adam',
+    parser.add_argument("--optimizer", type=str, default='Adam',
                         choices=['AdamW', 'SGD', 'Adam', 'lion', 'rmp'])
+    parser.add_argument("--num_workers", type=int, default=0,
     parser.add_argument("--num_workers", type=int, default=0,
                         help="number of data loading workers, if in windows, must be 0"
                         )
     parser.add_argument("--seed", type=int,
+                        default=random.randint(0, 1000000), help="random seed")
                         default=random.randint(0, 1000000), help="random seed")
     parser.add_argument("--resume", type=str,
                         default='', help="path to two latest checkpoint.")
@@ -24,6 +27,7 @@ def args():
                         help="Whether to use amp in mixed precision")
     parser.add_argument("--cuDNN", type=bool, default=False,
                         help="Whether use cuDNN to accelerate your program")
+    parser.add_argument("--loss", type=str, default='bce',
     parser.add_argument("--loss", type=str, default='bce',
                         choices=['BCEBlurWithLogitsLoss', 'mse', 'bce',
                                  'FocalLoss'], help="loss function")
@@ -60,12 +64,12 @@ def args():
     parser.add_argument("--patience", type=int, default=15,
                         help="Number of epochs to wait before early stopping")
     #  此处开始训练
-    arges = parser.parse_args()
+    arges=parser.parse_args()
     return arges
 
 
 if __name__ == '__main__':
-    arges = args()
+    arges=args()
     if arges.wgan:
         train_WGAN(arges)
     else:
