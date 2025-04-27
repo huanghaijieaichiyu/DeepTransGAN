@@ -8,7 +8,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.optim import Lion, RMSpropTF
+from timm.optim.lion import Lion
+from timm.optim.rmsprop_tf import RMSpropTF
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
 from torch.optim import Adam, AdamW, SGD

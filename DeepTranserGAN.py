@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
-from torch.utils import tensorboard
+from torch.utils.tensorboard.writer import SummaryWriter
 from torch.utils.data import DataLoader
 from torcheval.metrics.functional import peak_signal_noise_ratio
 from torchvision import transforms
@@ -32,7 +32,6 @@ from tqdm import tqdm  # 更新导入以使用新的autocast API
 
 from datasets.data_set import LowLightDataset
 from models.base_mode import Generator, Discriminator
-from models.efficient_generator import LightweightGenerator
 from utils.misic import set_random_seed, get_opt, get_loss, ssim, model_structure, save_path
 
 
@@ -210,7 +209,7 @@ class BaseTrainer:
         # 路径设置
         self.path = save_path(
             args.save_path) if args.resume == '' else args.resume
-        self.log = tensorboard.writer.SummaryWriter(
+        self.log = SummaryWriter(
             log_dir=self.path, filename_suffix=str(args.epochs), flush_secs=180)
 
         # 模型保存策略
@@ -777,22 +776,11 @@ class StandardGANTrainer(BaseTrainer):
             batch_count += 1
             low_images = low_images.to(self.device)
             high_images = high_images.to(self.device)
-
-            # 检查输入数据是否包含NaN
-            if torch.isnan(low_images).any() or torch.isnan(high_images).any():
-                self.log_message("警告: 输入数据包含NaN值，跳过此批次")
-                continue
-
             # 使用混合精度训练 - 使用正确的autocast
-            with autocast(enabled=self.args.autocast):
+            with autocast(enabled=self.args.amp):
                 # 训练判别器
-                for j in range(self.d_updates_per_g):  # 使用 TTUR
-                    if self.d_optimizer is not None:
-                        self.d_optimizer.zero_grad(
-                            set_to_none=True)  # 更高效的梯度清零
-                    else:
-                        continue  # 如果没有判别器优化器，跳过判别器训练
-
+                self.d_optimizer.zero_grad()
+                for j in range(self.args.d_steps):
                     # 生成假图像
                     with torch.no_grad():
                         fake = self.generator(low_images)
@@ -824,8 +812,7 @@ class StandardGANTrainer(BaseTrainer):
                     self.d_optimizer.step()
 
                 # 训练生成器
-                self.g_optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
-
+                self.g_optimizer.zero_grad()
                 # 重新生成假图像（因为需要梯度）
                 fake = self.generator(low_images)
 
@@ -979,8 +966,8 @@ class WGAN_GPTrainer(BaseTrainer):
         g_z_value = 0.0
 
         # 设置自动混合精度上下文
-        scaler_g = torch.cuda.amp.GradScaler(enabled=self.args.autocast)
-        scaler_c = torch.cuda.amp.GradScaler(enabled=self.args.autocast)
+        scaler_g = torch.cuda.amp.GradScaler(enabled=self.args.amp)
+        scaler_c = torch.cuda.amp.GradScaler(enabled=self.args.amp)
 
         # 梯度累积计数器
         batch_count = 0
@@ -1025,7 +1012,7 @@ class WGAN_GPTrainer(BaseTrainer):
                 for j in range(self.d_updates_per_g):  # 评论器多次更新
                     self.c_optimizer.zero_grad(set_to_none=True)
 
-                    with autocast(enabled=self.args.autocast):
+                    with autocast(enabled=self.args.amp):
                         # 生成假图像（不需要计算梯度）
                         with torch.no_grad():
                             fake_images = self.generator(low_images)
@@ -1070,7 +1057,7 @@ class WGAN_GPTrainer(BaseTrainer):
             # 清空生成器梯度
             self.g_optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=self.args.autocast):
+            with autocast(enabled=self.args.amp):
                 # 生成假图像
                 fake_images = self.generator(low_images)
 
@@ -1179,7 +1166,7 @@ class WGAN_GPTrainer(BaseTrainer):
 
 
 def train(args):
-    generator = LightweightGenerator()
+    generator = Generator()
     discriminator = Discriminator()
     model_structure(generator, (3, 256, 256))
     model_structure(discriminator, (3, 256, 256))
@@ -1194,20 +1181,6 @@ def train_WGAN(args):
     model_structure(critic, (3, 256, 256))
     trainer = WGAN_GPTrainer(args, generator, critic)
     trainer.train()
-
-
-def train_CUT(args):
-    """Train using CUT (Contrastive Unpaired Translation) approach"""
-    # Import here to avoid circular imports
-    from models.cut_trainer import train_cut
-    train_cut(args, fast_mode=False)
-
-
-def train_FastCUT(args):
-    """Train using FastCUT approach (faster version of CUT)"""
-    # Import here to avoid circular imports
-    from models.cut_trainer import train_cut
-    train_cut(args, fast_mode=True)
 
 
 class BasePredictor:
@@ -1470,35 +1443,34 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, lambda_gp=10.0)
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, default='runs/cut', help='path')
+    parser.add_argument('--path', type=str, default='runs', help='path')
     parser.add_argument('--mode',
                         type=str,
-                        default='cut',
-                        choices=['gan', 'wgan', 'cut', 'fastcut', 'predict'],
-                        help='训练或预测模式选择: gan, wgan, cut, fastcut, predict')
-    parser.add_argument('--model-type',
-                        type=str,
-                        default='cut',
-                        choices=['gen', 'lightweight',
-                                 'advanced', 'cut', 'fastcut'],
-                        help='模型类型: gen (标准生成器), lightweight (轻量级), advanced (高级), cut, fastcut')
+                        default='gan',
+                        choices=['gan', 'wgan', 'fastcut', 'predict'],
+                        help='训练或预测模式选择: gan, wgan')
     parser.add_argument(
         '--data', default='../datasets/kitti_LOL', type=str, help='数据集根目录')
     parser.add_argument('--epochs', type=int, default=500, help='训练轮数')
     parser.add_argument('--batch-size', type=int, default=8, help='批次大小')
     parser.add_argument('--device', default='cuda',
                         help='cuda设备, 例如 0 或 0,1,2,3 或 cpu')
+    parser.add_argument('--d_steps', type=int, default=5, help='判别器训练次数')
     parser.add_argument('--lr', type=float, default=3.5e-4, help='学习率')
-    parser.add_argument('--beta1', type=float,
+    parser.add_argument('--optimizer', type=str, default='adam',
+                        choices=['adam', 'adamw', 'sgd'], help='优化器类型')
+    parser.add_argument('--b1', type=float,
                         default=0.5, help='Adam优化器beta1')
-    parser.add_argument('--beta2', type=float,
+    parser.add_argument('--b2', type=float,
                         default=0.999, help='Adam优化器beta2')
-    parser.add_argument('--loss', type=str, default='MSELoss', help='损失函数类型')
+    parser.add_argument('--loss', type=str, default='mse',
+                        choices=['mse', 'bceblurwithlogitsloss', 'bce', 'focal'], help='损失函数类型')
     parser.add_argument('--save-path', type=str,
-                        default='./runs/', help='模型保存路径')
+                        default='runs/', help='模型保存路径')
+    parser.add_argument('--amp', action='store_true', help='启用AMP')
     parser.add_argument('--patience', type=int, default=20, help='早停耐心值')
     parser.add_argument('--resume', type=str, default='',
-                        help='恢复训练: runs/exp/last.pt')
+                        help='恢复训练')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--deterministic', action='store_true', help='启用确定性模式')
     parser.add_argument('--benchmark', action='store_true', help='启用cudnn基准测试')
@@ -1512,11 +1484,6 @@ if __name__ == '__main__':
                         default=0.0, help='内容损失权重，设为0禁用')
     parser.add_argument('--style-weight', type=float,
                         default=0.0, help='风格损失权重，设为0禁用')
-    parser.add_argument('--nce-temp', type=float,
-                        default=0.07, help='CUT/FastCUT NCE温度系数')
-    parser.add_argument('--nce-weight', type=float,
-                        default=1.0, help='CUT/FastCUT NCE损失权重')
-
     args = parser.parse_args()
     set_random_seed(args.seed, args.deterministic, args.benchmark)
 
@@ -1528,7 +1495,3 @@ if __name__ == '__main__':
             train(args)
         elif args.mode == 'wgan':
             train_WGAN(args)
-        elif args.mode == 'cut':
-            train_CUT(args)
-        elif args.mode == 'fastcut':
-            train_FastCUT(args)

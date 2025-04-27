@@ -1,0 +1,37 @@
+[project]
+name = "inr2rgb"
+version = "0.1.0"
+description = "A diffusion model for inr2rgb, based on the paper 'INR2RGB: Learning Realistic Image Synthesis via Implicit Neural Representations'"
+readme = "README.md"
+requires-python = "==3.10.11"
+dependencies = [
+    # Core PyTorch (CUDA version handled by install command)---windows 最好去官网下载才能调用GPU
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "torchaudio==2.6.0",
+    "torcheval",
+    # Hugging Face ecosystem
+    "diffusers>=0.20.0",
+    "accelerate>=0.25.0",
+    "transformers>=4.30.0",
+    # xformers (version resolved via extra-index-url)
+    "xformers",
+    # Utilities
+    "tqdm",
+    "Pillow",
+    "numpy",
+    "opencv-python",
+    "scikit-image",
+    "imageio",
+    "matplotlib",
+    "tensorboard",
+    "rich",
+    "ptflops",
+    "timm>=0.9.12",
+    
+    
+    # Optional: wandb
+]
+
+[tool.uv]
+# You can add uv specific configurations here if needed later

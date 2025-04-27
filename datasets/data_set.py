@@ -8,7 +8,7 @@ import numpy as np
 import os
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import cv2
+from PIL import Image  # 导入 PIL Image
 
 
 class LowLightDataset(Dataset):
@@ -73,16 +73,18 @@ class LowLightDataset(Dataset):
         """
         low_img_path, high_img_path = self.data[idx]
         if os.path.exists(low_img_path):
-            low_img = cv2.imread(low_img_path)  # OpenCV读取图像
-            # 转换为RGB
-            low_img = cv2.cvtColor(
-                low_img, cv2.COLOR_BGR2RGB)
+            # 使用 PIL 读取图像，确保是 RGB
+            low_img = Image.open(low_img_path).convert("RGB")
         else:
-            low_img = np.zeros((256, 256, 3), dtype=np.float32)
-        high_img = cv2.imread(high_img_path)  # OpenCV读取图像
-        # 转换为RGB
-        high_img = cv2.cvtColor(
-            high_img, cv2.COLOR_BGR2RGB)
+            # 如果文件不存在，创建一个空的黑色 PIL 图像
+            # 注意：如果图像大小不固定，这里可能需要调整
+            # 或者在 transform 中处理 None 的情况
+            # 暂时创建一个 256x256 的黑色图像作为占位符
+            low_img = Image.new('RGB', (256, 256), (0, 0, 0))
+            print(f"警告: 未找到低光图像 {low_img_path}, 使用黑色图像替代。")  # 添加警告
+
+        # 使用 PIL 读取图像，确保是 RGB
+        high_img = Image.open(high_img_path).convert("RGB")
 
         if self.transform:
             low_img = self.transform(low_img)
