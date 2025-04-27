@@ -183,6 +183,17 @@ def parse_args():
     parser.add_argument(
         "--validation_epochs", type=int, default=5, help="每 N 个 epoch 运行一次验证 (将基于步数触发)"
     )
+    # === 添加 Accelerate 日志报告目标 ===
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help=(
+            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
+            ' `"wandb"`, `"comet_ml"` and `"clearml"`. Use `"all"` to report to all integrations.'
+        ),
+    )
+    # ===========================
 
     # === 添加轻量化 UNet 参数 ===
     parser.add_argument(
@@ -460,7 +471,7 @@ def main():
             # 为批次中的每个图像采样随机时间步
             # 确保 timesteps 是 LongTensor
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                0, noise_scheduler.config["num_train_timesteps"], (bsz,), device=clean_images.device
             ).long()
 
             # 根据噪声和时间步将噪声添加到干净图像中，得到噪声图像
