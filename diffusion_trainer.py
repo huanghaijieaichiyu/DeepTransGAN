@@ -21,7 +21,7 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMSchedulerOutput
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
-from diffusers.utils.import_utils import is_wandb_available, is_xformers_available
+from diffusers.utils.import_utils import is_xformers_available
 
 import accelerate
 from accelerate import Accelerator
@@ -139,9 +139,6 @@ def parse_args():
         "--logging_dir", type=str, default="logs", help="TensorBoard 日志目录"
     )
     parser.add_argument(
-        "--report_to", type=str, default="tensorboard", help=('报告结果和日志的平台。支持："tensorboard", "wandb"')
-    )
-    parser.add_argument(
         "--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"], help="是否使用混合精度训练。选择 'fp16' 或 'bf16' (需要 PyTorch >= 1.10)，或 'no' 关闭。"
     )
     parser.add_argument(
@@ -200,12 +197,6 @@ def parse_args():
             "FP16 is not recommended for multi-GPU training. Setting mixed_precision to 'no'.")
         args.mixed_precision = "no"  # 多 GPU 不推荐 fp16
 
-    # 检查报告平台
-    if args.report_to == "wandb":
-        if not is_wandb_available():
-            raise ImportError("请安装 wandb 以使用 --report_to=wandb")
-        # 在 main 函数中条件导入 wandb
-
     # === 轻量化配置覆盖 ===
     if args.lightweight_unet:
         # logger.info("使用轻量化 UNet 配置...") # <-- 移动到 main 函数
@@ -240,10 +231,6 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
-
-    # 条件导入 wandb
-    if args.report_to == "wandb" and accelerator.is_main_process:
-        import wandb
 
     # 设置日志 (Accelerator 初始化之后)
     logging.basicConfig(
@@ -375,7 +362,7 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler  # 添加 eval_dataloader
     )
 
-    # 初始化追踪器 (wandb/tensorboard)
+    # 初始化追踪器 (tensorboard)
     if accelerator.is_main_process:
         run_name = Path(
             args.output_dir).name if args.output_dir else "diffusion_conditional_run"
@@ -473,7 +460,7 @@ def main():
             # 为批次中的每个图像采样随机时间步
             # 确保 timesteps 是 LongTensor
             timesteps = torch.randint(
-                0, noise_scheduler.num_train_timesteps, (bsz,), device=clean_images.device
+                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
             ).long()
 
             # 根据噪声和时间步将噪声添加到干净图像中，得到噪声图像
@@ -687,26 +674,26 @@ def main():
                             # 使用 accelerator.log 记录指标
                             accelerator.log(metrics_to_log, step=global_step)
 
-                            # 记录图像到 tracker
+                            # 记录图像到 tracker (tensorboard 或其他)
                             if generated_images_pil:  # 确保有图像可记录
-                                if args.report_to == "wandb" and is_wandb_available():
-                                    # 确保 wandb 已导入 (在 main 开始时处理)
-                                    try:
-                                        accelerator.log(
-                                            {tracker_key: [wandb.Image(
-                                                img, caption=f"Low|Enhanced|Clean {i}") for i, img in enumerate(generated_images_pil)]},
-                                            step=global_step
-                                        )
-                                    except NameError:
-                                        logger.warning("wandb 未定义，无法记录图像。")
-                                else:  # 记录到 tensorboard 或本地文件
+                                try:
+                                    # 直接让 accelerate 处理 PIL 图像列表
+                                    accelerator.log(
+                                        {tracker_key: generated_images_pil},
+                                        step=global_step
+                                    )
+                                    logger.info(
+                                        f"验证样本图像已记录到 tracker ({args.report_to})")
+                                except Exception as e:
+                                    logger.warning(f"无法将验证图像记录到 tracker: {e}")
+                                    # 如果 tracker 记录失败，仍保存到本地文件
                                     sample_dir = os.path.join(
                                         args.output_dir, "validation_samples")
                                     os.makedirs(sample_dir, exist_ok=True)
                                     for idx, img in enumerate(generated_images_pil):
                                         img.save(os.path.join(
                                             sample_dir, f"epoch-{epoch+1}_step-{global_step}_sample-{idx}.png"))
-                                    logger.info(f"验证样本图像已保存到 {sample_dir}")
+                                    logger.info(f"验证样本图像已保存到本地 {sample_dir}")
 
                             # 清理 GPU 缓存
                             del unet  # 删除对 unwrap 模型的引用

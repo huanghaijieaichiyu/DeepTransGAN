@@ -15,7 +15,7 @@ dependencies = [
     "accelerate>=0.25.0",
     "transformers>=4.30.0",
     # xformers (version resolved via extra-index-url)
-    "xformers",
+    "xformers == 0.0.29.post3",
     # Utilities
     "tqdm",
     "Pillow",
@@ -27,10 +27,7 @@ dependencies = [
     "tensorboard",
     "rich",
     "ptflops",
-    "timm>=0.9.12",
-    
-    
-    # Optional: wandb
+    "timm>=0.9.12" 
 ]
 
 [tool.uv]
