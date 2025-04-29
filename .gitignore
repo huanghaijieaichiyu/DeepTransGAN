@@ -149,3 +149,4 @@ test.py
 /uv.lock
 /runs_diffusion
 /run_diffusion
+/run_diffusion/logs/run_diffusion/events.out.tfevents.1745917803.huang.5708.0
