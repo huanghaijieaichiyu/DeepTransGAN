@@ -32,44 +32,7 @@ from tqdm.auto import tqdm
 from torchvision import transforms
 from torcheval.metrics.functional import peak_signal_noise_ratio
 
-# 尝试导入 ssim，如果 utils.misic 不可用，则稍后定义
-try:
-    from utils.misic import ssim, save_path as original_save_path  # 重命名导入
-    # 创建一个包装器以匹配预期的签名（如果原始签名不匹配）
-
-    def save_path(path, model='train', **kwargs):
-        # 假设原始 save_path 接受 path 和 model
-        # 如果原始 save_path 需要其他参数，需要在这里处理 kwargs
-        # 或者直接修改原始 save_path 函数
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        default_path = os.path.join(
-            path, f"diffusion_{model}_{timestamp}_{os.getpid()}")
-        try:
-            # 尝试调用原始函数，如果它存在且签名大致匹配
-            # 注意：这仍然可能出错，如果原始函数签名完全不同
-            # return original_save_path(path=path, model=model)
-            # 更安全的做法是直接使用新的实现
-            return default_path
-        except TypeError:
-            print("警告：原始 save_path 签名不兼容，使用默认路径格式。")
-            return default_path
-
-except ImportError:
-    print("警告：无法从 utils.misic 导入 ssim 或 save_path。如果需要，请确保这些函数可用或在脚本中定义。")
-    # 定义一个临时的 ssim 占位符或从其他地方导入
-
-    def ssim(img1, img2):
-        # 这里需要一个实际的 SSIM 实现
-        # 为了避免训练中断，返回一个虚拟值
-        print("警告：SSIM 函数未完全实现！返回 0.0。")
-        return torch.tensor(0.0)
-
-    def save_path(path, model='train', **kwargs):  # 修正签名
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        # 确保返回一个字符串路径
-        return os.path.join(path, f"diffusion_{model}_{timestamp}_{os.getpid()}")
-
-
+from utils.misic import ssim, save_path
 from datasets.data_set import LowLightDataset  # 假设数据集类可用
 
 # 检查 diffusers 版本
@@ -85,7 +48,7 @@ def parse_args():
         "--data_dir", type=str, default="../datasets/kitti_LOL", help="数据集根目录"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="diffusion_output_conditional", help="模型和日志输出目录"
+        "--output_dir", type=str, default="runs_diffusion", help="模型和日志输出目录"
     )
     parser.add_argument("--overwrite_output_dir",
                         action="store_true", help="是否覆盖输出目录")
