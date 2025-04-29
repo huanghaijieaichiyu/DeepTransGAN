@@ -48,7 +48,7 @@ def parse_args():
         "--data_dir", type=str, default="../datasets/kitti_LOL", help="数据集根目录"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="runs_diffusion", help="模型和日志输出目录"
+        "--output_dir", type=str, default="run_diffusion", help="所有输出 (模型, 日志等) 的根目录"
     )
     parser.add_argument("--overwrite_output_dir",
                         action="store_true", help="是否覆盖输出目录")
@@ -59,10 +59,7 @@ def parse_args():
         "--resolution", type=int, default=256, help="输入图像分辨率"
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="训练批次大小"
-    )
-    parser.add_argument(
-        "--eval_batch_size", type=int, default=4, help="评估批次大小"
+        "--batch_size", type=int, default=4, help="训练和评估的批次大小"
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -99,9 +96,6 @@ def parse_args():
         "--max_grad_norm", default=1.0, type=float, help="最大梯度范数（用于梯度裁剪）"
     )
     parser.add_argument(
-        "--logging_dir", type=str, default="logs", help="TensorBoard 日志目录"
-    )
-    parser.add_argument(
         "--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"], help="是否使用混合精度训练。选择 'fp16' 或 'bf16' (需要 PyTorch >= 1.10)，或 'no' 关闭。"
     )
     parser.add_argument(
@@ -123,7 +117,7 @@ def parse_args():
         "--unet_layers_per_block", type=int, default=2, help="UNet 中每个块的 ResNet 层数"
     )
     parser.add_argument(
-        "--unet_block_channels", nargs='+', type=int, default=[128, 128, 256, 256, 512, 512], help="UNet 各层级的通道数"
+        "--unet_block_channels", nargs='+', type=int, default=[32, 32, 32, 64, 64, 128], help="UNet 各层级的通道数"
     )
     parser.add_argument(
         "--unet_down_block_types", nargs='+', type=str,
@@ -196,7 +190,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    # 日志目录固定在 output_dir 下的 'logs'
+    logging_dir = os.path.join(args.output_dir, "logs")
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
@@ -308,13 +303,12 @@ def main():
         train_dataset = LowLightDataset(
             image_dir=args.data_dir, transform=preprocess, phase="train")
         train_dataloader = DataLoader(
-            train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True
+            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True
         )
         eval_dataset = LowLightDataset(
             image_dir=args.data_dir, transform=eval_preprocess, phase="test")
         eval_dataloader = DataLoader(
-            # 使用 eval_batch_size
-            eval_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
+            eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
         )
     except Exception as e:
         logger.error(
@@ -359,7 +353,7 @@ def main():
             args.max_train_steps / num_update_steps_per_epoch)
 
     # 断点续训逻辑 (基本保持不变)
-    total_batch_size = args.train_batch_size * \
+    total_batch_size = args.batch_size * \
         accelerator.num_processes * args.gradient_accumulation_steps
     global_step = 0
     first_epoch = 0
@@ -405,7 +399,7 @@ def main():
     logger.info(f"  Num eval examples = {len(eval_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(
-        f"  Instantaneous batch size per device = {args.train_batch_size}")
+        f"  Instantaneous batch size per device = {args.batch_size}")
     logger.info(
         f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(
@@ -457,7 +451,7 @@ def main():
                 # 收集损失用于日志记录
                 # accelerator.gather 返回 tensor (主进程) 或 None (其他进程)
                 gathered_loss = accelerator.gather(
-                    loss.repeat(args.train_batch_size))
+                    loss.repeat(args.batch_size))
                 # .mean() 应该在 tensor 上调用
                 if gathered_loss is not None:  # 只有主进程计算 avg_loss
                     # 确保 gathered_loss 是 tensor

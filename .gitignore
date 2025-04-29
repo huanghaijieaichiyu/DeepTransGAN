@@ -148,3 +148,4 @@ test.py
 /diffusion_output_conditional
 /uv.lock
 /runs_diffusion
+/run_diffusion
