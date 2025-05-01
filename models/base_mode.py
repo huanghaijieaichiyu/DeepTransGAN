@@ -1,7 +1,7 @@
 import math
 import torch.nn as nn
 import torch
-from models.common import SPPELAN, C2f, C2fCIB, Concat, Disconv, Gencov, SCDown
+from models.common import SPPELAN, C2f, C2fCIB, Concat, Conv, Disconv, Gencov, SCDown
 
 
 class BaseNetwork(nn.Module):

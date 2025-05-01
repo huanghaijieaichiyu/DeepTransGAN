@@ -20,16 +20,17 @@
 
 ## 效果展示
 
-*您可以在此处替换为扩散模型生成的效果图*
+_您可以在此处替换为扩散模型生成的效果图_
 
-| 输入（低光照）                      | 输出（扩散模型增强后）               |
-| :----------------------------------: | :---------------------------------: |
-| ![低光照图像](examples/real.png)     | ![增强后图像](examples/fake.png)     |
-| *(示例图，请替换为实际效果)*        | *(示例图，请替换为实际效果)*        |
+|          输入（低光照）          |      输出（扩散模型增强后）      |
+| :------------------------------: | :------------------------------: |
+| ![低光照图像](examples/real.png) | ![增强后图像](examples/fake.png) |
+|   _(示例图，请替换为实际效果)_   |   _(示例图，请替换为实际效果)_   |
 
 ## 预训练模型
 
 我们提供了基于 LOL 数据集训练的预训练 **扩散模型 UNet**：
+
 - 模型下载: [![模型下载](https://img.shields.io/badge/模型下载-天翼云盘-blue?style=flat-square&logo=icloud)](https://cloud.189.cn/web/share?code=AJ7fUzBbuUzm) (访问码: q2u9)
 - 下载后解压，你会得到一个包含 `diffusion_pytorch_model.bin` 和 `config.json` 的目录。在预测时，将 `--model_path` 指向此目录。
 
@@ -44,6 +45,7 @@
 ## 安装步骤
 
 1.  **克隆仓库:**
+
     ```bash
     git clone https://github.com/yourusername/INR2RGB.git # 请替换为你的仓库地址
     cd INR2RGB
@@ -51,6 +53,7 @@
 
 2.  **安装 `uv` (如果尚未安装):**
     `uv` 是一个快速的 Python 包安装和解析器。
+
     ```bash
     # macOS / Linux
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -60,9 +63,11 @@
 
     # 其他安装方式见: https://github.com/astral-sh/uv#installation
     ```
+
     安装后请确保 `uv` 在你的 PATH 中，可能需要重启终端。
 
 3.  **创建并激活虚拟环境 (推荐):**
+
     ```bash
     # 使用 uv 创建虚拟环境 (推荐)
     uv venv .venv
@@ -90,6 +95,7 @@
 项目使用 LOL 数据集 (Low-Light paired dataset) 或类似的 **低光照 / 正常光照 配对** 数据集。
 
 数据集结构应如下：
+
 ```
 datasets/
 └── <your_dataset_name>/  # 例如 kitti_LOL
@@ -110,9 +116,10 @@ datasets/
         ├── high/
         └── low/
 ```
+
 **重要**: `LowLightDataset` 类 (`datasets/data_set.py`) 需要根据你的具体数据集结构和命名约定进行调整。当前的实现是基于 LOL 数据集的 `eval15` 和 `our485` 目录结构。
 
-您可以从 [LOL数据集官网](https://daooshee.github.io/BMVC2018website/) 下载 LOL 数据集，或使用自己的数据集（确保调整 `LowLightDataset` 实现）。
+您可以从 [LOL 数据集官网](https://daooshee.github.io/BMVC2018website/) 下载 LOL 数据集，或使用自己的数据集（确保调整 `LowLightDataset` 实现）。
 
 ## 使用方法
 
@@ -127,6 +134,7 @@ datasets/
     推荐使用 `accelerate` 启动训练，以方便使用分布式训练和混合精度。
 
     **单 GPU 训练:**
+
     ```bash
     accelerate launch diffusion_trainer.py \
         --data_dir ../datasets/kitti_LOL \
@@ -143,17 +151,20 @@ datasets/
         --validation_epochs 10 \
         --seed 42
         # --enable_xformers_memory_efficient_attention # 如果安装了 xformers 可以启用
-        # --resume_from_checkpoint latest # 从最新的检查点恢复
+        # --resum latest # 从最新的检查点恢复
         # --lightweight_unet # 使用轻量级UNet进行快速测试
     ```
 
     **多 GPU 训练:**
     首先配置 `accelerate`:
+
     ```bash
     accelerate config
     ```
+
     按照提示配置你的多 GPU 环境（通常选择 "This machine" 并指定使用的 GPU 数量）。
     然后使用相同的命令启动：
+
     ```bash
     accelerate launch diffusion_trainer.py [其他参数同上...]
     ```
@@ -245,31 +256,34 @@ INR2RGB/
 ## 常见问题
 
 1.  **CUDA 内存不足 (OOM Error)**:
-    *   在训练时 (`diffusion_trainer.py`):
-        *   减小 `--train_batch_size`。
-        *   增大 `--gradient_accumulation_steps`。
-        *   确保已启用 `--mixed_precision fp16` (或 `bf16` 如果硬件支持)。
-        *   尝试启用 `--gradient_checkpointing` (会稍慢但更省内存)。
-        *   尝试启用 `--enable_xformers_memory_efficient_attention` (如果已安装 `xformers`)。
-        *   降低 `--resolution`。
-    *   在预测时 (`diffusion_predictor.py`):
-        *   减小 `--eval_batch_size` (图像模式)。
-        *   降低 `--resolution`。
+
+    - 在训练时 (`diffusion_trainer.py`):
+      - 减小 `--train_batch_size`。
+      - 增大 `--gradient_accumulation_steps`。
+      - 确保已启用 `--mixed_precision fp16` (或 `bf16` 如果硬件支持)。
+      - 尝试启用 `--gradient_checkpointing` (会稍慢但更省内存)。
+      - 尝试启用 `--enable_xformers_memory_efficient_attention` (如果已安装 `xformers`)。
+      - 降低 `--resolution`。
+    - 在预测时 (`diffusion_predictor.py`):
+      - 减小 `--eval_batch_size` (图像模式)。
+      - 降低 `--resolution`。
 
 2.  **训练不稳定或效果不佳**:
-    *   调整学习率 `--learning_rate`。
-    *   尝试不同的学习率调度器 `--lr_scheduler` 和预热步数 `--lr_warmup_steps`。
-    *   调整 UNet 模型结构参数 (通道数、块类型等，需要修改代码或添加更多命令行参数)。
-    *   确保数据集质量和配对准确性。
-    *   增加训练轮数 `--num_train_epochs`。
+
+    - 调整学习率 `--learning_rate`。
+    - 尝试不同的学习率调度器 `--lr_scheduler` 和预热步数 `--lr_warmup_steps`。
+    - 调整 UNet 模型结构参数 (通道数、块类型等，需要修改代码或添加更多命令行参数)。
+    - 确保数据集质量和配对准确性。
+    - 增加训练轮数 `--num_train_epochs`。
 
 3.  **`LowLightDataset` 报错**:
-    *   请仔细检查你的数据集目录结构是否与 `datasets/data_set.py` 中 `LowLightDataset` 类的预期匹配。
-    *   根据你的实际数据集结构修改 `LowLightDataset` 中的文件路径查找逻辑。
+
+    - 请仔细检查你的数据集目录结构是否与 `datasets/data_set.py` 中 `LowLightDataset` 类的预期匹配。
+    - 根据你的实际数据集结构修改 `LowLightDataset` 中的文件路径查找逻辑。
 
 4.  **`uv` 安装或使用问题**:
-    *   查阅 `uv` 官方文档: [https://github.com/astral-sh/uv](https://github.com/astral-sh/uv)
-    *   确保 `uv` 已正确添加到系统 PATH。
+    - 查阅 `uv` 官方文档: [https://github.com/astral-sh/uv](https://github.com/astral-sh/uv)
+    - 确保 `uv` 已正确添加到系统 PATH。
 
 ## 引用
 

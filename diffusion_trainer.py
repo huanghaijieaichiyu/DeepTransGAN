@@ -34,6 +34,7 @@ from torcheval.metrics.functional import peak_signal_noise_ratio
 
 from utils.misic import ssim, save_path
 from datasets.data_set import LowLightDataset  # 假设数据集类可用
+import lpips  # <-- 添加 LPIPS 导入
 
 # 检查 diffusers 版本
 check_min_version("0.10.0")  # 示例版本，根据需要调整
@@ -72,31 +73,33 @@ def parse_args():
         "--gradient_checkpointing", action="store_true", help="是否启用梯度检查点"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=1e-4, help="优化器初始学习率"
+        "--learning_rate", type=float, default=3e-4, help="优化器初始学习率"
     )
     parser.add_argument(
-        "--lr_scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"], help="学习率调度器类型"
+        "--lr_scheduler", type=str, default="cosine",
+        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"], help="学习率调度器类型"
     )
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=500, help="学习率预热步数"
     )
     parser.add_argument(
-        "--adam_beta1", type=float, default=0.9, help="AdamW 优化器的 beta1 参数"
+        "--b1", type=float, default=0.5, help="AdamW 优化器的 beta1 参数"
     )
     parser.add_argument(
-        "--adam_beta2", type=float, default=0.999, help="AdamW 优化器的 beta2 参数"
+        "--b2", type=float, default=0.999, help="AdamW 优化器的 beta2 参数"
     )
     parser.add_argument(
-        "--adam_weight_decay", type=float, default=1e-2, help="AdamW 优化器的权重衰减"
+        "--weight_decay", type=float, default=1e-7, help="AdamW 优化器的权重衰减"
     )
     parser.add_argument(
-        "--adam_epsilon", type=float, default=1e-08, help="AdamW 优化器的 epsilon 参数"
+        "--epsilon", type=float, default=1e-07, help="AdamW 优化器的 epsilon 参数"
     )
     parser.add_argument(
         "--max_grad_norm", default=1.0, type=float, help="最大梯度范数（用于梯度裁剪）"
     )
     parser.add_argument(
-        "--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"], help="是否使用混合精度训练。选择 'fp16' 或 'bf16' (需要 PyTorch >= 1.10)，或 'no' 关闭。"
+        "--mixed_precision", type=str, default='no', choices=["no", "fp16", "bf16"],
+        help="是否使用混合精度训练。选择 'fp16' 或 'bf16' (需要 PyTorch >= 1.10)，或 'no' 关闭。"
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="是否启用 xformers 内存高效注意力"
@@ -108,7 +111,7 @@ def parse_args():
         "--checkpoints_total_limit", type=int, default=5, help=("限制检查点总数。删除旧的检查点。(调整默认值)")
     )
     parser.add_argument(
-        "--resume_from_checkpoint", type=str, default=None, help="从哪个检查点恢复训练 ('latest' 或特定路径)"
+        "--resume", type=str, default=None, help="从哪个检查点恢复训练 ('latest' 或特定路径)"
     )
     parser.add_argument(
         "--num_workers", type=int, default=0, help="Dataloader 使用的工作线程数"
@@ -117,17 +120,17 @@ def parse_args():
         "--unet_layers_per_block", type=int, default=2, help="UNet 中每个块的 ResNet 层数"
     )
     parser.add_argument(
-        "--unet_block_channels", nargs='+', type=int, default=[32, 32, 32, 64, 64, 128], help="UNet 各层级的通道数"
+        "--unet_block_channels", nargs='+', type=int, default=[64, 64, 128, 128, 256, 256], help="UNet 各层级的通道数"
     )
     parser.add_argument(
         "--unet_down_block_types", nargs='+', type=str,
         default=["DownBlock2D", "DownBlock2D", "DownBlock2D",
-                 "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"],
+                 "DownBlock2D", "DownBlock2D", "AttnDownBlock2D"],
         help="UNet 下采样块类型"
     )
     parser.add_argument(
         "--unet_up_block_types", nargs='+', type=str,
-        default=["UpBlock2D", "AttnUpBlock2D", "UpBlock2D",
+        default=["AttnUpBlock2D", "UpBlock2D", "UpBlock2D",
                  "UpBlock2D", "UpBlock2D", "UpBlock2D"],
         help="UNet 上采样块类型"
     )
@@ -140,6 +143,11 @@ def parse_args():
     parser.add_argument(
         "--validation_epochs", type=int, default=5, help="每 N 个 epoch 运行一次验证 (将基于步数触发)"
     )
+    # === 添加 LPIPS 损失权重 ===
+    parser.add_argument(
+        "--lambda_lpips", type=float, default=0.5, help="LPIPS 损失的权重"  # <-- 添加 lambda_lpips 参数
+    )
+    # =========================
     # === 添加 Accelerate 日志报告目标 ===
     parser.add_argument(
         "--report_to",
@@ -224,14 +232,8 @@ def main():
 
     # 创建输出目录
     if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-        if args.overwrite_output_dir and os.path.exists(args.output_dir):
-            logger.info(f"Overwriting output directory {args.output_dir}")
-            # 实际的清理逻辑可以根据需要添加
-            # import shutil
-            # shutil.rmtree(args.output_dir)
-            # os.makedirs(args.output_dir, exist_ok=True)
+        save_path(args.output_dir)
+        logger.info(f"Overwriting output directory {args.output_dir}")
 
     # 初始化模型 - 使用解析后的参数
     logger.info("Initializing UNet model...")
@@ -276,9 +278,9 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+        betas=(args.b1, args.b2),
+        weight_decay=args.weight_decay,
+        eps=args.epsilon,
     )
 
     # 数据处理 (保持不变，确保输出在 [-1, 1])
@@ -358,9 +360,9 @@ def main():
     global_step = 0
     first_epoch = 0
 
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+    if args.resume:
+        if args.resume != "latest":
+            path = os.path.basename(args.resume)
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
@@ -370,9 +372,9 @@ def main():
 
         if path is None:
             accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+                f"Checkpoint '{args.resume}' does not exist. Starting a new training run."
             )
-            args.resume_from_checkpoint = None
+            args.resume = None
         else:
             checkpoint_path = os.path.join(args.output_dir, path)
             accelerator.print(f"Resuming from checkpoint {checkpoint_path}")
@@ -393,6 +395,24 @@ def main():
             first_epoch = global_step // num_update_steps_per_epoch
             # resume_step 不再需要以这种方式计算，因为 dataloader 不会被跳过
             # accelerator.load_state 会处理学习率调度器的状态
+
+    # === 初始化 LPIPS 模型 ===
+    # 只在主进程打印加载信息，但所有进程都需要加载模型
+    if accelerator.is_main_process:
+        logger.info("Initializing LPIPS model...")
+    try:
+        # 使用预训练的 AlexNet
+        lpips_model = lpips.LPIPS(net='alex').to(accelerator.device)
+        # LPIPS 模型不需要训练
+        lpips_model.eval()
+        # 确保在混合精度下正确运行 (通常 LPIPS 在 fp32 下计算)
+        # 不需要 accelerator.prepare，因为它不参与梯度计算和优化
+        logger.info("LPIPS model initialized successfully.")
+    except Exception as e:
+        logger.error(
+            f"Failed to initialize LPIPS model: {e}. LPIPS loss will not be used.")
+        lpips_model = None  # 设置为 None，后续逻辑会跳过 LPIPS 计算
+    # ========================
 
     logger.info("***** Running training *****")
     logger.info(f"  Num train examples = {len(train_dataset)}")
@@ -445,10 +465,41 @@ def main():
                 # 预测噪声残差
                 noise_pred = model(model_input, timesteps).sample
 
-                # 计算损失 (预测噪声和实际添加噪声之间的 MSE)
-                loss = F.mse_loss(noise_pred, noise)
+                # 1. 计算 MSE 损失 (预测噪声和实际添加噪声之间的 MSE)
+                loss_mse = F.mse_loss(noise_pred.float(),
+                                      noise.float())  # 确保 float 类型
 
-                # 收集损失用于日志记录
+                # 2. 计算 LPIPS 损失 (如果 LPIPS 模型成功加载)
+                loss_lpips = torch.tensor(0.0).to(accelerator.device)  # 初始化为 0
+                if lpips_model is not None and args.lambda_lpips > 0:
+                    # 需要估算去噪后的图像 pred_x0
+                    # 使用 scheduler 的 alphas_cumprod
+                    # 确保 alphas_cumprod 在正确的设备上并且形状匹配
+                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(
+                        timesteps.device)
+                    sqrt_alpha_prod = alphas_cumprod[timesteps].sqrt(
+                    ).view(-1, 1, 1, 1)
+                    sqrt_one_minus_alpha_prod = (
+                        1 - alphas_cumprod[timesteps]).sqrt().view(-1, 1, 1, 1)
+
+                    # 计算 pred_x0
+                    # pred_x0 = (noisy_images - sqrt(1 - alpha_prod_t) * noise_pred) / sqrt(alpha_prod_t)
+                    pred_x0 = (noisy_images - sqrt_one_minus_alpha_prod *
+                               noise_pred) / sqrt_alpha_prod
+
+                    # 将 pred_x0 和 clean_images clamp 到 [-1, 1] 以确保 LPIPS 输入范围正确
+                    pred_x0_clamp = torch.clamp(pred_x0, -1.0, 1.0)
+                    clean_images_clamp = torch.clamp(clean_images, -1.0, 1.0)
+
+                    # 计算 LPIPS 损失
+                    # LPIPS 模型通常在 fp32 下运行更稳定
+                    loss_lpips = lpips_model(
+                        pred_x0_clamp.float(), clean_images_clamp.float()).mean()
+
+                # 3. 合并损失
+                loss = loss_mse + args.lambda_lpips * loss_lpips
+
+                # 收集损失用于日志记录 (收集总损失)
                 # accelerator.gather 返回 tensor (主进程) 或 None (其他进程)
                 gathered_loss = accelerator.gather(
                     loss.repeat(args.batch_size))
@@ -486,11 +537,25 @@ def main():
                 if accelerator.is_main_process:
                     current_lr = lr_scheduler.get_last_lr(
                     )[0] if lr_scheduler else args.learning_rate
-                    logs = {"loss": train_loss, "lr": current_lr,
-                            "epoch": epoch + 1}  # 添加 epoch
-                    progress_bar.set_postfix(
-                        **{"loss": f"{train_loss:.4f}", "lr": f"{current_lr:.6f}", "epoch": epoch + 1})
+                    # --- 修改日志内容 ---
+                    logs = {
+                        "loss": train_loss,  # 这是累积的总损失
+                        # 当前 step 的 mse loss
+                        "loss_mse": loss_mse.item() / args.gradient_accumulation_steps if accelerator.is_main_process else 0.0,
+                        "loss_lpips": loss_lpips.item() / args.gradient_accumulation_steps if accelerator.is_main_process and lpips_model is not None and args.lambda_lpips > 0 else 0.0,  # 当前 step 的 lpips loss
+                        "lr": current_lr,
+                        "epoch": epoch + 1
+                    }
+                    postfix_dict = {
+                        "loss": f"{train_loss:.4f}",  # 显示累积总损失
+                        "mse": f"{logs['loss_mse']:.4f}",  # 显示当前 mse
+                        "lpips": f"{logs['loss_lpips']:.4f}",  # 显示当前 lpips
+                        "lr": f"{current_lr:.6f}",
+                        "epoch": epoch + 1
+                    }
+                    progress_bar.set_postfix(**postfix_dict)
                     accelerator.log(logs, step=global_step)
+                    # --- 结束修改 ---
                 train_loss = 0.0  # 重置累积损失
 
                 # 定期验证 (基于 global_step)
@@ -655,13 +720,23 @@ def main():
                                 except Exception as e:
                                     logger.warning(f"无法将验证图像记录到 tracker: {e}")
                                     # 如果 tracker 记录失败，仍保存到本地文件
-                                    sample_dir = os.path.join(
-                                        args.output_dir, "validation_samples")
-                                    os.makedirs(sample_dir, exist_ok=True)
-                                    for idx, img in enumerate(generated_images_pil):
-                                        img.save(os.path.join(
-                                            sample_dir, f"epoch-{epoch+1}_step-{global_step}_sample-{idx}.png"))
-                                    logger.info(f"验证样本图像已保存到本地 {sample_dir}")
+                                    # 这个本地保存的逻辑现在会移到外面，无论如何都执行
+
+                                # --- 新增：总是保存验证样本到本地 ---
+                                sample_dir = os.path.join(
+                                    args.output_dir, "validation_samples")
+                                os.makedirs(sample_dir, exist_ok=True)
+                                for idx, img in enumerate(generated_images_pil):
+                                    # 使用更详细的文件名，包含 epoch 和 step
+                                    save_filename = os.path.join(
+                                        sample_dir, f"epoch-{epoch+1}_step-{global_step}_sample-{idx}.png")
+                                    try:
+                                        img.save(save_filename)
+                                    except Exception as save_err:
+                                        logger.error(
+                                            f"保存验证样本图像失败 {save_filename}: {save_err}")
+                                logger.info(f"验证样本图像已保存到本地目录 {sample_dir}")
+                                # --- 结束新增代码 ---
 
                             # 清理 GPU 缓存
                             del unet  # 删除对 unwrap 模型的引用
