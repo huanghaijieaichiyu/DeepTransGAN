@@ -285,6 +285,150 @@ INR2RGB/
     - 查阅 `uv` 官方文档: [https://github.com/astral-sh/uv](https://github.com/astral-sh/uv)
     - 确保 `uv` 已正确添加到系统 PATH。
 
+## 依赖结构
+inr2rgb v0.1.0
+├── accelerate v1.6.0
+│   ├── huggingface-hub v0.30.2
+│   │   ├── filelock v3.18.0
+│   │   ├── fsspec v2025.3.2
+│   │   ├── packaging v25.0
+│   │   ├── pyyaml v6.0.2
+│   │   ├── requests v2.32.3
+│   │   │   ├── certifi v2025.4.26
+│   │   │   ├── charset-normalizer v3.4.1
+│   │   │   ├── idna v3.10
+│   │   │   └── urllib3 v2.4.0
+│   │   ├── tqdm v4.67.1
+│   │   └── typing-extensions v4.13.2
+│   ├── numpy v2.2.5
+│   ├── packaging v25.0
+│   ├── psutil v7.0.0
+│   ├── pyyaml v6.0.2
+│   ├── safetensors v0.5.3
+│   └── torch v2.6.0
+│       ├── filelock v3.18.0
+│       ├── fsspec v2025.3.2
+│       ├── jinja2 v3.1.6
+│       │   └── markupsafe v3.0.2
+│       ├── networkx v3.4.2
+│       ├── nvidia-cublas-cu12 v12.4.5.8
+│       ├── nvidia-cuda-cupti-cu12 v12.4.127
+│       ├── nvidia-cuda-nvrtc-cu12 v12.4.127
+│       ├── nvidia-cuda-runtime-cu12 v12.4.127
+│       ├── nvidia-cudnn-cu12 v9.1.0.70
+│       │   └── nvidia-cublas-cu12 v12.4.5.8
+│       ├── nvidia-cufft-cu12 v11.2.1.3
+│       │   └── nvidia-nvjitlink-cu12 v12.4.127
+│       ├── nvidia-curand-cu12 v10.3.5.147
+│       ├── nvidia-cusolver-cu12 v11.6.1.9
+│       │   ├── nvidia-cublas-cu12 v12.4.5.8
+│       │   ├── nvidia-cusparse-cu12 v12.3.1.170
+│       │   │   └── nvidia-nvjitlink-cu12 v12.4.127
+│       │   └── nvidia-nvjitlink-cu12 v12.4.127
+│       ├── nvidia-cusparse-cu12 v12.3.1.170 (*)
+│       ├── nvidia-cusparselt-cu12 v0.6.2
+│       ├── nvidia-nccl-cu12 v2.21.5
+│       ├── nvidia-nvjitlink-cu12 v12.4.127
+│       ├── nvidia-nvtx-cu12 v12.4.127
+│       ├── sympy v1.13.1
+│       │   └── mpmath v1.3.0
+│       ├── triton v3.2.0
+│       └── typing-extensions v4.13.2
+├── diffusers v0.33.1
+│   ├── filelock v3.18.0
+│   ├── huggingface-hub v0.30.2 (*)
+│   ├── importlib-metadata v8.6.1
+│   │   └── zipp v3.21.0
+│   ├── numpy v2.2.5
+│   ├── pillow v11.2.1
+│   ├── regex v2024.11.6
+│   ├── requests v2.32.3 (*)
+│   └── safetensors v0.5.3
+├── imageio v2.37.0
+│   ├── numpy v2.2.5
+│   └── pillow v11.2.1
+├── matplotlib v3.10.1
+│   ├── contourpy v1.3.2
+│   │   └── numpy v2.2.5
+│   ├── cycler v0.12.1
+│   ├── fonttools v4.57.0
+│   ├── kiwisolver v1.4.8
+│   ├── numpy v2.2.5
+│   ├── packaging v25.0
+│   ├── pillow v11.2.1
+│   ├── pyparsing v3.2.3
+│   └── python-dateutil v2.9.0.post0
+│       └── six v1.17.0
+├── numpy v2.2.5
+├── opencv-python v4.11.0.86
+│   └── numpy v2.2.5
+├── pillow v11.2.1
+├── ptflops v0.7.4
+│   └── torch v2.6.0 (*)
+├── rich v14.0.0
+│   ├── markdown-it-py v3.0.0
+│   │   └── mdurl v0.1.2
+│   ├── pygments v2.19.1
+│   └── typing-extensions v4.13.2
+├── scikit-image v0.25.2
+│   ├── imageio v2.37.0 (*)
+│   ├── lazy-loader v0.4
+│   │   └── packaging v25.0
+│   ├── networkx v3.4.2
+│   ├── numpy v2.2.5
+│   ├── packaging v25.0
+│   ├── pillow v11.2.1
+│   ├── scipy v1.15.2
+│   │   └── numpy v2.2.5
+│   └── tifffile v2025.3.30
+│       └── numpy v2.2.5
+├── tensorboard v2.19.0
+│   ├── absl-py v2.2.2
+│   ├── grpcio v1.71.0
+│   ├── markdown v3.8
+│   ├── numpy v2.2.5
+│   ├── packaging v25.0
+│   ├── protobuf v6.30.2
+│   ├── setuptools v79.0.1
+│   ├── six v1.17.0
+│   ├── tensorboard-data-server v0.7.2
+│   └── werkzeug v3.1.3
+│       └── markupsafe v3.0.2
+├── timm v1.0.15
+│   ├── huggingface-hub v0.30.2 (*)
+│   ├── pyyaml v6.0.2
+│   ├── safetensors v0.5.3
+│   ├── torch v2.6.0 (*)
+│   └── torchvision v0.21.0
+│       ├── numpy v2.2.5
+│       ├── pillow v11.2.1
+│       └── torch v2.6.0 (*)
+├── torch v2.6.0 (*)
+├── torchaudio v2.6.0
+│   └── torch v2.6.0 (*)
+├── torcheval v0.0.7
+│   └── typing-extensions v4.13.2
+├── torchvision v0.21.0 (*)
+├── tqdm v4.67.1
+├── transformers v4.51.3
+│   ├── filelock v3.18.0
+│   ├── huggingface-hub v0.30.2 (*)
+│   ├── numpy v2.2.5
+│   ├── packaging v25.0
+│   ├── pyyaml v6.0.2
+│   ├── regex v2024.11.6
+│   ├── requests v2.32.3 (*)
+│   ├── safetensors v0.5.3
+│   ├── tokenizers v0.21.1
+│   │   └── huggingface-hub v0.30.2 (*)
+│   └── tqdm v4.67.1
+└── xformers v0.0.29.post3
+    ├── numpy v2.2.5
+    └── torch v2.6.0 (*)
+(*) Package tree already dis
+
+-----建议用锁定文件进行训练、测试
+
 ## 引用
 
 如果你在研究中使用了本项目，请考虑引用 `diffusers` 库和相关的扩散模型论文。可以添加如下引用：

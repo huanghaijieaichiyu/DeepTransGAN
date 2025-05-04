@@ -73,7 +73,7 @@ def parse_args():
         "--gradient_checkpointing", action="store_true", help="是否启用梯度检查点"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=3e-4, help="优化器初始学习率"
+        "--learning_rate", type=float, default=4e-4, help="优化器初始学习率"
     )
     parser.add_argument(
         "--lr_scheduler", type=str, default="cosine",
@@ -83,13 +83,13 @@ def parse_args():
         "--lr_warmup_steps", type=int, default=500, help="学习率预热步数"
     )
     parser.add_argument(
-        "--b1", type=float, default=0.5, help="AdamW 优化器的 beta1 参数"
+        "--b1", type=float, default=0.9, help="AdamW 优化器的 beta1 参数"
     )
     parser.add_argument(
         "--b2", type=float, default=0.999, help="AdamW 优化器的 beta2 参数"
     )
     parser.add_argument(
-        "--weight_decay", type=float, default=1e-7, help="AdamW 优化器的权重衰减"
+        "--weight_decay", type=float, default=1e-2, help="AdamW 优化器的权重衰减"
     )
     parser.add_argument(
         "--epsilon", type=float, default=1e-07, help="AdamW 优化器的 epsilon 参数"
@@ -98,7 +98,7 @@ def parse_args():
         "--max_grad_norm", default=1.0, type=float, help="最大梯度范数（用于梯度裁剪）"
     )
     parser.add_argument(
-        "--mixed_precision", type=str, default='no', choices=["no", "fp16", "bf16"],
+        "--mixed_precision", type=str, default='fp16', choices=["no", "fp16", "bf16"],
         help="是否使用混合精度训练。选择 'fp16' 或 'bf16' (需要 PyTorch >= 1.10)，或 'no' 关闭。"
     )
     parser.add_argument(
