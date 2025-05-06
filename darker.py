@@ -335,7 +335,7 @@ class Darker:
 
 if __name__ == '__main__':
     # Example usage for image processing
-    data_dir = "../datasets/kitti_LOL"  # 替换为你的数据集路径
+    data_dir = "/mnt/f/datasets/nuscenes_lol"  # 替换为你的数据集路径
     base_ratio = 0.05  # 基础暗度（远处最暗）可以更低
 
     # 定义蒙版参数 (可以调整)

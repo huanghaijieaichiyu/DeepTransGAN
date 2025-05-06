@@ -13,6 +13,7 @@ import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 
 import diffusers
+import xformers  # 导入 xformers
 # Import ConfigMixin for type hinting
 from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.unets.unet_2d import UNet2DModel
@@ -21,7 +22,6 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMSchedulerOutput
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
-from diffusers.utils.import_utils import is_xformers_available
 
 import accelerate
 from accelerate import Accelerator
@@ -251,20 +251,8 @@ def main():
         up_block_types=args.unet_up_block_types,
     )
 
-    # 检查 xformers
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            try:
-                import xformers  # 导入 xformers
-                model.enable_xformers_memory_efficient_attention()
-                logger.info("启用 xformers 内存高效注意力")
-            except Exception as e:
-                logger.warning(
-                    f"无法启用 xformers 内存高效注意力: {e}。请确保安装了正确版本的 xformers。请尝试 `pip install -U xformers`"
-                )
-        else:
-            logger.warning(
-                "未安装 xformers，无法启用内存高效注意力。请尝试 `pip install xformers`")
+    model.enable_xformers_memory_efficient_attention()
+    logger.info("启用 xformers 内存高效注意力")
 
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()

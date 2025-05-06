@@ -16,6 +16,7 @@ from diffusers.models.unets.unet_2d import UNet2DModel
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler, DDPMSchedulerOutput
 
 from datasets.data_set import LowLightDataset  # 重命名导入以区分
+from utils.video_writer import video_writer  # 导入视频合成函数
 
 
 def save_output_path(base_path, model_type='predict'):
@@ -270,7 +271,8 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
     def predict_video(self):
         """执行单个视频的预测"""
         print(f"开始视频预测: {self.video_path}")
-        output_dir = os.path.join(self.output_path, 'predictions')  # 保存单帧图像的目录
+        # 定义保存单帧图像的目录
+        frames_output_dir = os.path.join(self.output_path, 'predictions')
 
         # 1. 打开视频文件并获取属性
         try:
@@ -281,7 +283,7 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
 
             # 获取视频帧率、尺寸和总帧数
             fps = cap.get(cv2.CAP_PROP_FPS)
-            # 注意：输出视频的尺寸将是模型的 resolution
+            # 输出视频的尺寸将是模型的 resolution
             out_width = self.args.resolution
             out_height = self.args.resolution
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -295,31 +297,12 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
             print(f"读取视频属性时出错: {e}")
             return
 
-        # 2. 设置视频写入器 (如果需要保存输出视频)
-        writer = None
-        if self.args.save_output_video:
-            video_output_filename = os.path.join(
-                self.output_path, "enhanced_video.mp4")
-            try:
-                # 选择合适的编码器 (mp4v 适用于 .mp4 文件)
-                # Linter 可能无法识别 cv2.VideoWriter_fourcc，但用法是正确的
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore
-                writer = cv2.VideoWriter(
-                    video_output_filename, fourcc, fps, (out_width, out_height))
-                if not writer.isOpened():
-                    print(f"错误: 无法在 {video_output_filename} 创建视频写入器")
-                    writer = None  # 确保 writer 为 None 以便后续检查
-                else:
-                    print(f"输出视频将保存到: {video_output_filename}")
-            except Exception as e:
-                print(f"创建视频写入器时出错: {e}")
-                writer = None
-
-        # 3. 逐帧处理视频
+        # 2. 逐帧处理视频
         frame_count = 0
         # 如果总帧数已知，创建进度条
         pbar = tqdm(total=total_frames if total_frames >
                     0 else None, desc="视频处理进度")
+        frames_processed = False  # 标记是否处理了至少一帧
 
         try:
             while True:
@@ -330,7 +313,6 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
 
                 # a. 预处理帧: BGR -> RGB -> 应用转换 -> 增加批次维度
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                # 修正：先 transform 再 unsqueeze
                 low_light_tensor = self.frame_transform(
                     frame_rgb).unsqueeze(0)  # [1, 3, H, W]
 
@@ -348,21 +330,14 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
                 enhanced_frame_bgr = cv2.cvtColor(
                     enhanced_frame_uint8, cv2.COLOR_RGB2BGR)  # 转回 BGR 以便 OpenCV 处理
 
-                # d. 保存或显示处理后的帧
-                # 定期保存单帧图像
-                if frame_count % self.args.save_frame_interval == 0:
-                    img_save_path = os.path.join(
-                        output_dir, f"frame_{frame_count:06d}.png")
-                    cv2.imwrite(img_save_path, enhanced_frame_bgr)
-
-                # 写入输出视频
-                if writer is not None:
-                    # 确保帧尺寸与写入器匹配 (理论上应该匹配，因为 transform 已处理)
-                    if enhanced_frame_bgr.shape[1] != out_width or enhanced_frame_bgr.shape[0] != out_height:
-                        # 如果不匹配则调整大小 (以防万一)
-                        enhanced_frame_bgr = cv2.resize(
-                            enhanced_frame_bgr, (out_width, out_height))
-                    writer.write(enhanced_frame_bgr)
+                # d. 保存处理后的帧 (每一帧都保存)
+                img_save_path = os.path.join(
+                    frames_output_dir, f"frame_{frame_count:06d}.png")
+                # 确保帧尺寸符合预期 (理论上应该匹配，因为 transform 已处理)
+                if enhanced_frame_bgr.shape[1] != out_width or enhanced_frame_bgr.shape[0] != out_height:
+                    enhanced_frame_bgr = cv2.resize(
+                        enhanced_frame_bgr, (out_width, out_height))
+                cv2.imwrite(img_save_path, enhanced_frame_bgr)
 
                 # 可选：实时显示帧 (可能降低处理速度)
                 if self.args.display_video:
@@ -379,6 +354,7 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
                         break
 
                 frame_count += 1
+                frames_processed = True  # 标记已处理帧
                 if total_frames > 0:  # 仅当总帧数已知时更新进度条
                     pbar.update(1)
                 else:  # 如果总帧数未知，仅更新描述
@@ -388,14 +364,24 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
             print(f"\n在处理第 {frame_count} 帧时发生错误: {e}")
             traceback.print_exc()  # 打印详细错误信息
         finally:
-            # 4. 清理资源
+            # 3. 清理资源
             pbar.close()
             cap.release()  # 释放视频捕获对象
-            if writer is not None:
-                writer.release()  # 释放视频写入器
-                print("输出视频已保存。")
             cv2.destroyAllWindows()  # 关闭所有 OpenCV 窗口
-            print(f"视频预测完成。共处理 {frame_count} 帧。")
+            print(f"视频帧处理完成。共处理并保存 {frame_count} 帧到 {frames_output_dir}。")
+
+        # 4. 调用 video_writer 合成视频 (仅当成功处理了帧)
+        if frames_processed:
+            video_output_path = os.path.join(
+                self.output_path, "enhanced_video.mp4")
+            print(f"\n开始使用 {frames_output_dir} 中的帧合成视频...")
+            try:
+                # 调用导入的函数
+                video_writer(frames_output_dir, video_output_path)
+            except Exception as e:
+                print(f"调用 video_writer 合成视频时发生错误: {e}")
+        else:
+            print("未处理任何帧，跳过视频合成。")
 
 
 def parse_predict_args():
@@ -429,10 +415,6 @@ def parse_predict_args():
     # 视频模式特定参数
     parser.add_argument("--video_path", type=str,
                         help="输入视频文件的路径 (仅 video 模式)。")
-    parser.add_argument("--save_output_video", action="store_true",
-                        help="是否保存增强后的视频文件 (仅 video 模式)。")
-    parser.add_argument("--save_frame_interval", type=int, default=50,
-                        help="每隔 N 帧保存一张增强后的图像 (仅 video 模式)。")
     parser.add_argument("--display_video", action="store_true",
                         help="在处理过程中实时显示原始帧和增强帧 (可能较慢, 仅 video 模式)。")
 
@@ -447,11 +429,17 @@ def parse_predict_args():
     if not os.path.isdir(args.model_path):
         parser.error(
             f"--model_path '{args.model_path}' 不是一个有效的目录。请提供包含模型文件的目录路径。")
-    # 检查模型文件是否存在
-    if not os.path.exists(os.path.join(args.model_path, 'diffusion_pytorch_model.bin')):
+    # 检查模型权重文件 (.bin 或 .safetensors) 和配置文件是否存在
+    model_bin_path = os.path.join(
+        args.model_path, 'diffusion_pytorch_model.bin')
+    model_safetensors_path = os.path.join(
+        args.model_path, 'diffusion_pytorch_model.safetensors')
+    config_path = os.path.join(args.model_path, 'config.json')
+
+    if not os.path.exists(model_bin_path) and not os.path.exists(model_safetensors_path):
         parser.error(
-            f"在 '{args.model_path}' 目录下未找到 'diffusion_pytorch_model.bin'。")
-    if not os.path.exists(os.path.join(args.model_path, 'config.json')):
+            f"在 '{args.model_path}' 目录下未找到 'diffusion_pytorch_model.bin' 或 'diffusion_pytorch_model.safetensors'。")
+    if not os.path.exists(config_path):
         parser.error(f"在 '{args.model_path}' 目录下未找到 'config.json'。")
 
     return args

@@ -152,3 +152,4 @@ test.py
 /run_diffusion/logs/run_diffusion/events.out.tfevents.1745917803.huang.5708.0
 /worker.js
 /run_diffusion_cond_lpips
+diffusion_predictions
