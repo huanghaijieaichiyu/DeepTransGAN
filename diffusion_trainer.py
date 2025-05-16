@@ -8,6 +8,7 @@ from PIL import Image
 import time  # 引入 time 模块
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.utils.data import DataLoader
@@ -16,7 +17,8 @@ import diffusers
 import xformers  # 导入 xformers
 # Import ConfigMixin for type hinting
 from diffusers.configuration_utils import ConfigMixin
-from diffusers.models.unets.unet_2d import UNet2DModel
+
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 # 引入 DDPMSchedulerOutput 用于类型提示
 from diffusers.schedulers.scheduling_ddpm import DDPMSchedulerOutput
@@ -34,7 +36,7 @@ from torcheval.metrics.functional import peak_signal_noise_ratio
 
 from utils.misic import ssim, save_path
 from datasets.data_set import LowLightDataset  # 假设数据集类可用
-import lpips  # <-- 添加 LPIPS 导入
+import lpips
 
 # 检查 diffusers 版本
 check_min_version("0.10.0")  # 示例版本，根据需要调整
@@ -42,14 +44,72 @@ check_min_version("0.10.0")  # 示例版本，根据需要调整
 logger = get_logger(__name__, log_level="INFO")
 
 
+# === 定义条件编码器 ===
+class ConditioningEncoder(nn.Module):
+    def __init__(self, in_channels=3, base_c=64, levels=3, out_dim=256):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        current_channels = in_channels
+        # 根据 levels 动态调整 base_c，确保最后一层通道数合理
+        # 例如，如果 levels=3, base_c=64, 则通道为 64, 128, 256
+        # 如果 levels=4, base_c=32, 则通道为 32, 64, 128, 256
+
+        actual_base_c = base_c
+        if levels > 0:
+            # 目标是让最后一层卷积前的通道数接近 out_dim 或一个较大的固定值
+            # 例如，如果希望最后一层卷积前的通道数为 256，而 levels=4
+            # 256 / (2**(4-1)) = 256 / 8 = 32. So actual_base_c = 32.
+            # 确保 actual_base_c 至少为 16 或 32
+            # target_last_conv_channels = 256 # 可调整
+            # if levels > 0:
+            #     actual_base_c = max(16, target_last_conv_channels // (2**(levels -1)))
+
+            for i in range(levels):
+                output_channels_level = actual_base_c * (2**i)
+                self.layers.append(
+                    nn.Sequential(
+                        nn.Conv2d(current_channels, output_channels_level,
+                                  kernel_size=3, padding=1),
+                        nn.SiLU(),
+                        nn.Conv2d(output_channels_level,
+                                  output_channels_level, kernel_size=3, padding=1),
+                        nn.SiLU(),
+                        nn.Conv2d(output_channels_level, output_channels_level,
+                                  kernel_size=3, padding=1, stride=2),  # 下采样
+                        nn.SiLU()
+                    )
+                )
+                current_channels = output_channels_level
+
+        # Final projection to out_dim (cross_attention_dim)
+        # current_channels 是最后一个下采样模块的输出通道数
+        # Kernel 1x1 to change dim
+        self.final_conv = nn.Conv2d(current_channels, out_dim, kernel_size=1)
+        logger.info(
+            f"ConditioningEncoder initialized: in_channels={in_channels}, base_c={actual_base_c}, levels={levels}, final_conv_in={current_channels}, out_dim={out_dim}")
+
+    def forward(self, condition_image):
+        x = condition_image
+        for layer in self.layers:
+            x = layer(x)
+        # x is now B, C_last, H_final, W_final
+        x = self.final_conv(x)  # B, out_dim, H_final, W_final
+
+        # Reshape for cross-attention: B, H_final * W_final, out_dim
+        batch_size, channels, height, width = x.shape
+        x = x.view(batch_size, channels, height * width).permute(0, 2, 1)
+        return x
+# =======================
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Simple example of a conditional diffusion model training script for low-light enhancement.")
     parser.add_argument(
-        "--data_dir", type=str, default="../datasets/kitti_LOL", help="数据集根目录"
+        "--data", type=str, default="../datasets/kitti_LOL", help="数据集根目录"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="run_diffusion", help="所有输出 (模型, 日志等) 的根目录"
+        "--output_dir", type=str, default="run_diffusion_cross_attn", help="所有输出 (模型, 日志等) 的根目录"
     )
     parser.add_argument("--overwrite_output_dir",
                         action="store_true", help="是否覆盖输出目录")
@@ -73,7 +133,8 @@ def parse_args():
         "--gradient_checkpointing", action="store_true", help="是否启用梯度检查点"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=4e-4, help="优化器初始学习率"
+        # 调整了默认值
+        "--learning_rate", type=float, default=2e-4, help="优化器初始学习率 (调整,可能需要更低)"
     )
     parser.add_argument(
         "--lr_scheduler", type=str, default="cosine",
@@ -105,10 +166,10 @@ def parse_args():
         "--enable_xformers_memory_efficient_attention", action="store_true", help="是否启用 xformers 内存高效注意力"
     )
     parser.add_argument(
-        "--checkpointing_steps", type=int, default=5000, help="每 N 步保存一次检查点(调整默认值)"
+        "--checkpointing_steps", type=int, default=5000, help="每 N 步保存一次检查点"
     )
     parser.add_argument(
-        "--checkpoints_total_limit", type=int, default=5, help=("限制检查点总数。删除旧的检查点。(调整默认值)")
+        "--checkpoints_total_limit", type=int, default=5, help="限制检查点总数。删除旧的检查点。"
     )
     parser.add_argument(
         "--resume", type=str, default=None, help="从哪个检查点恢复训练 ('latest' 或特定路径)"
@@ -116,24 +177,52 @@ def parse_args():
     parser.add_argument(
         "--num_workers", type=int, default=0, help="Dataloader 使用的工作线程数"
     )
+
+    # === UNet 参数 ===
+    parser.add_argument(
+        "--unet_in_channels", type=int, default=3, help="UNet 输入通道数 (通常为3，对应噪声图像)"
+    )
+    parser.add_argument(
+        "--unet_out_channels", type=int, default=3, help="UNet 输出通道数 (通常为3，对应预测噪声)"
+    )
     parser.add_argument(
         "--unet_layers_per_block", type=int, default=2, help="UNet 中每个块的 ResNet 层数"
     )
     parser.add_argument(
-        "--unet_block_channels", nargs='+', type=int, default=[64, 64, 128, 128, 256, 256], help="UNet 各层级的通道数"
+        "--unet_block_channels", nargs='+', type=int, default=[64, 64, 128, 128, 256, 256],
+        help="UNet 各层级的通道数 (根据 UNet2DConditionModel 的典型配置调整)"  # 调整了默认值
     )
+    # 为 UNet2DConditionModel 更新默认的 block types 以包含 CrossAttn
     parser.add_argument(
         "--unet_down_block_types", nargs='+', type=str,
-        default=["DownBlock2D", "DownBlock2D", "DownBlock2D",
-                 "DownBlock2D", "DownBlock2D", "AttnDownBlock2D"],
-        help="UNet 下采样块类型"
+        default=["CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D",
+                 "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"],  # 示例调整
+        help="UNet 下采样块类型 (使用 CrossAttn 变体)"
     )
     parser.add_argument(
         "--unet_up_block_types", nargs='+', type=str,
-        default=["AttnUpBlock2D", "UpBlock2D", "UpBlock2D",
-                 "UpBlock2D", "UpBlock2D", "UpBlock2D"],
-        help="UNet 上采样块类型"
+        default=["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D",
+                 "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],  # 示例调整
+        help="UNet 上采样块类型 (使用 CrossAttn 变体)"
     )
+    parser.add_argument(
+        "--unet_mid_block_type", type=str, default="UNetMidBlock2DCrossAttn",  # 确保中间块也支持交叉注意力
+        help="UNet 中间块类型"
+    )
+    parser.add_argument(
+        "--cross_attention_dim", type=int, default=128, help="交叉注意力维度 (ConditioningEncoder的输出维度)"
+    )
+
+    # === Conditioning Encoder 参数 ===
+    parser.add_argument(
+        "--cond_enc_base_c", type=int, default=64, help="ConditioningEncoder 基础通道数"
+    )
+    parser.add_argument(
+        "--cond_enc_levels", type=int, default=3, help="ConditioningEncoder 层级数 (下采样次数)"
+    )
+    # cross_attention_dim 已经定义在 UNet 参数部分，它也是 cond_enc 的输出维度
+
+    # === 推断和验证参数 ===
     parser.add_argument(
         "--num_inference_steps", type=int, default=50, help="采样/推断步数"
     )
@@ -145,7 +234,7 @@ def parse_args():
     )
     # === 添加 LPIPS 损失权重 ===
     parser.add_argument(
-        "--lambda_lpips", type=float, default=0.5, help="LPIPS 损失的权重"  # <-- 添加 lambda_lpips 参数
+        "--lambda_lpips", type=float, default=0.5, help="LPIPS 损失的权重"
     )
     # =========================
     # === 添加 Accelerate 日志报告目标 ===
@@ -171,25 +260,25 @@ def parse_args():
     if env_local_rank != -1 and args.mixed_precision == "fp16":
         logger.warning(
             "FP16 is not recommended for multi-GPU training. Setting mixed_precision to 'no'.")
-        args.mixed_precision = "no"  # 多 GPU 不推荐 fp16
+        args.mixed_precision = "no"
 
     # === 轻量化配置覆盖 ===
     if args.lightweight_unet:
-        # logger.info("使用轻量化 UNet 配置...") # <-- 移动到 main 函数
         args.unet_layers_per_block = 1
-        args.unet_block_channels = [64, 64, 128, 128]  # 减少层级和通道
+        args.unet_block_channels = [32, 64, 128]  # 进一步减少通道数
         args.unet_down_block_types = [
-            "DownBlock2D",
-            "DownBlock2D",
-            "DownBlock2D",
+            "DownBlock2D",  # 第一个下采样块使用普通版本
+            "CrossAttnDownBlock2D",  # 中间使用交叉注意力
             "DownBlock2D",
         ]
         args.unet_up_block_types = [
             "UpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
+            "CrossAttnUpBlock2D",  # 中间使用交叉注意力
+            "UpBlock2D",  # 最后一个上采样块使用普通版本
         ]
+        args.cond_enc_base_c = 16  # 进一步减小条件编码器基础通道
+        args.cond_enc_levels = 2  # 保持层级，但通道数减少
+        args.cross_attention_dim = 64  # 大幅减少交叉注意力维度
     # ======================
 
     return args
@@ -198,7 +287,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 日志目录固定在 output_dir 下的 'logs'
     logging_dir = os.path.join(args.output_dir, "logs")
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir)
@@ -209,7 +297,6 @@ def main():
         project_config=accelerator_project_config,
     )
 
-    # 设置日志 (Accelerator 初始化之后)
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -221,91 +308,113 @@ def main():
     else:
         diffusers.utils.logging.set_verbosity_error()
 
-    # 在 Accelerator 初始化后记录轻量化配置信息
     if args.lightweight_unet:
-        logger.info("使用轻量化 UNet 配置...")
+        logger.info("使用轻量化 UNet 和 ConditioningEncoder 配置...")
 
-    # 设置随机种子
     if args.seed is not None:
         set_seed(args.seed)
-        logger.info(f"设置随机种子为: {args.seed}")  # 添加日志确认
+        logger.info(f"设置随机种子为: {args.seed}")
 
-    # 创建输出目录
     if accelerator.is_main_process:
-        save_path(args.output_dir)
-        logger.info(f"Overwriting output directory {args.output_dir}")
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+            if args.overwrite_output_dir:
+                logger.info(f"Overwriting output directory {args.output_dir}")
+        # save_path(args.output_dir) # os.makedirs 已经处理
 
-    # 初始化模型 - 使用解析后的参数
-    logger.info("Initializing UNet model...")
+    # 初始化条件编码器
+    logger.info("Initializing ConditioningEncoder model...")
+    condition_encoder = ConditioningEncoder(
+        in_channels=3,  # 低光照图像是3通道
+        base_c=args.cond_enc_base_c,
+        levels=args.cond_enc_levels,
+        out_dim=args.cross_attention_dim
+    )
+
+    # 初始化 UNet2DConditionModel
+    logger.info("Initializing UNet2DConditionModel...")
+    logger.info(f"  In channels: {args.unet_in_channels}")
+    logger.info(f"  Out channels: {args.unet_out_channels}")
     logger.info(f"  Layers per block: {args.unet_layers_per_block}")
     logger.info(f"  Block channels: {args.unet_block_channels}")
     logger.info(f"  Down blocks: {args.unet_down_block_types}")
     logger.info(f"  Up blocks: {args.unet_up_block_types}")
-    model = UNet2DModel(
+    logger.info(f"  Mid block type: {args.unet_mid_block_type}")
+    logger.info(f"  Cross Attention Dim: {args.cross_attention_dim}")
+
+    model = UNet2DConditionModel(
         sample_size=args.resolution,
-        in_channels=6,  # 修改这里: 3 (noisy) + 3 (condition)
-        out_channels=3,  # 预测噪声还是 3 通道
+        in_channels=args.unet_in_channels,  # 应该是3 (噪声图像)
+        out_channels=args.unet_out_channels,  # 应该是3 (预测噪声)
         layers_per_block=args.unet_layers_per_block,
-        block_out_channels=args.unet_block_channels,
-        down_block_types=args.unet_down_block_types,
-        up_block_types=args.unet_up_block_types,
+        block_out_channels=tuple(args.unet_block_channels),  # 需要是 tuple
+        down_block_types=tuple(args.unet_down_block_types),  # 需要是 tuple
+        up_block_types=tuple(args.unet_up_block_types),   # 需要是 tuple
+        mid_block_type=args.unet_mid_block_type,
+        cross_attention_dim=args.cross_attention_dim,
+        # attention_head_dim 可以尝试设置，或者让模型使用默认值
+        # attention_head_dim = args.cross_attention_dim // 4 # 示例
     )
 
-    model.enable_xformers_memory_efficient_attention()
-    logger.info("启用 xformers 内存高效注意力")
+    if args.enable_xformers_memory_efficient_attention:
+        try:
+            model.enable_xformers_memory_efficient_attention()
+            # condition_encoder 不需要这个，因为它主要是卷积
+            logger.info("启用 xformers 内存高效注意力 for UNet")
+        except Exception as e:
+            logger.warning(f"无法启用 xformers: {e}. 继续而不使用 xformers.")
 
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
+        # condition_encoder 并没有标准的 enable_gradient_checkpointing 方法
+        # 如果需要，需在其 forward 方法内手动使用 torch.utils.checkpoint.checkpoint
+        # logger.info("Gradient checkpointing enabled for ConditioningEncoder (manual impl. needed if effective)")
 
-    # 初始化噪声调度器
-    # DDPM 常用 1000 步, 尝试不同的 schedule
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2")
 
-    # 初始化优化器
+    # 初始化优化器 (包含 condition_encoder 的参数)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        list(model.parameters()) +
+        list(condition_encoder.parameters()),  # <--- 合并参数
         lr=args.learning_rate,
         betas=(args.b1, args.b2),
         weight_decay=args.weight_decay,
         eps=args.epsilon,
     )
 
-    # 数据处理 (保持不变，确保输出在 [-1, 1])
     preprocess = transforms.Compose(
         [
             transforms.Resize((args.resolution, args.resolution)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.5], [0.5]),  # 输出 [-1, 1]
         ]
     )
     eval_preprocess = transforms.Compose(
         [
             transforms.Resize((args.resolution, args.resolution)),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize([0.5], [0.5]),  # 输出 [-1, 1]
         ]
     )
 
-    # 创建数据集和数据加载器
     try:
         train_dataset = LowLightDataset(
-            image_dir=args.data_dir, transform=preprocess, phase="train")
+            image_dir=args.data, transform=preprocess, phase="train")
         train_dataloader = DataLoader(
             train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True
         )
         eval_dataset = LowLightDataset(
-            image_dir=args.data_dir, transform=eval_preprocess, phase="test")
+            image_dir=args.data, transform=eval_preprocess, phase="test")
         eval_dataloader = DataLoader(
             eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True
         )
     except Exception as e:
         logger.error(
-            f"加载数据集失败，请检查路径 '{args.data_dir}' 和 LowLightDataset 实现: {e}")
-        return  # 无法继续，退出
+            f"加载数据集失败，请检查路径 '{args.data}' 和 LowLightDataset 实现: {e}")
+        return
 
-    # 初始化学习率调度器
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -314,26 +423,20 @@ def main():
             train_dataloader) * args.num_train_epochs * args.gradient_accumulation_steps,
     )
 
-    # 使用 Accelerate 准备
-    # 注意 noise_scheduler 不需要 prepare
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler  # 添加 eval_dataloader
+    # 使用 Accelerate 准备 (包含 condition_encoder)
+    model, condition_encoder, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, condition_encoder, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
-    # 初始化追踪器 (tensorboard)
     if accelerator.is_main_process:
         run_name = Path(
-            args.output_dir).name if args.output_dir else "diffusion_conditional_run"
-
-        # 创建配置字典副本，并转换列表为字符串以兼容 TensorBoard hparams
+            args.output_dir).name if args.output_dir else "diffusion_cross_attn_run"
         config_to_log = vars(args).copy()
         for key in ["unet_block_channels", "unet_down_block_types", "unet_up_block_types"]:
             if key in config_to_log and isinstance(config_to_log[key], list):
                 config_to_log[key] = ",".join(map(str, config_to_log[key]))
-
         accelerator.init_trackers(run_name, config=config_to_log)
 
-    # 计算训练步数
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -342,7 +445,6 @@ def main():
         args.num_train_epochs = math.ceil(
             args.max_train_steps / num_update_steps_per_epoch)
 
-    # 断点续训逻辑 (基本保持不变)
     total_batch_size = args.batch_size * \
         accelerator.num_processes * args.gradient_accumulation_steps
     global_step = 0
@@ -352,7 +454,6 @@ def main():
         if args.resume != "latest":
             path = os.path.basename(args.resume)
         else:
-            # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
@@ -366,41 +467,27 @@ def main():
         else:
             checkpoint_path = os.path.join(args.output_dir, path)
             accelerator.print(f"Resuming from checkpoint {checkpoint_path}")
-            # 使用 load_state 时，模型、优化器、调度器等的状态会自动恢复
-            # 但需要手动恢复 global_step 和 epoch
             try:
                 accelerator.load_state(checkpoint_path)
-                # 假设 checkpoint 目录名包含 step 数
                 global_step = int(path.split("-")[1])
                 accelerator.print(
                     f"Successfully loaded state from {checkpoint_path}. Resuming global step {global_step}.")
             except Exception as e:
                 accelerator.print(
                     f"Failed to load state from {checkpoint_path}: {e}. Starting from scratch.")
-                global_step = 0  # 加载失败，从头开始
-
-            # resume_global_step = global_step  # 修正：global_step 已经是优化器步数
+                global_step = 0
             first_epoch = global_step // num_update_steps_per_epoch
-            # resume_step 不再需要以这种方式计算，因为 dataloader 不会被跳过
-            # accelerator.load_state 会处理学习率调度器的状态
 
-    # === 初始化 LPIPS 模型 ===
-    # 只在主进程打印加载信息，但所有进程都需要加载模型
     if accelerator.is_main_process:
         logger.info("Initializing LPIPS model...")
     try:
-        # 使用预训练的 AlexNet
         lpips_model = lpips.LPIPS(net='alex').to(accelerator.device)
-        # LPIPS 模型不需要训练
         lpips_model.eval()
-        # 确保在混合精度下正确运行 (通常 LPIPS 在 fp32 下计算)
-        # 不需要 accelerator.prepare，因为它不参与梯度计算和优化
         logger.info("LPIPS model initialized successfully.")
     except Exception as e:
         logger.error(
             f"Failed to initialize LPIPS model: {e}. LPIPS loss will not be used.")
-        lpips_model = None  # 设置为 None，后续逻辑会跳过 LPIPS 计算
-    # ========================
+        lpips_model = None
 
     logger.info("***** Running training *****")
     logger.info(f"  Num train examples = {len(train_dataset)}")
@@ -416,246 +503,216 @@ def main():
     logger.info(f"  Starting epoch = {first_epoch + 1}")
     logger.info(f"  Starting global step = {global_step}")
 
-    # ==========================\n    # === 开始训练循环 ===\n    # ==========================
     progress_bar = tqdm(range(global_step, args.max_train_steps),
                         disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         model.train()
+        condition_encoder.train()  # <--- 设置 condition_encoder 为训练模式
         train_loss = 0.0
 
         for step, batch in enumerate(train_dataloader):
-
-            # low_light_images: 条件输入, clean_images: 目标 (Ground Truth)
+            # low_light_images 作为条件, clean_images 作为目标
             low_light_images, clean_images = batch
 
-            # 采样噪声添加到干净图像
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]
-            # 为批次中的每个图像采样随机时间步
-            # 确保 timesteps 是 LongTensor
             timesteps = torch.randint(
                 0, noise_scheduler.config["num_train_timesteps"], (bsz,), device=clean_images.device
-            ).long()
+            ).int()  # 保持 .int()
 
-            # 根据噪声和时间步将噪声添加到干净图像中，得到噪声图像
-            # Revert to .long() for timesteps as it's generally accepted
             noisy_images = noise_scheduler.add_noise(
-                clean_images, noise, timesteps  # 使用 .long()
+                clean_images, noise, timesteps
             )
 
-            with accelerator.accumulate(model):
-                # 准备模型输入：拼接噪声图像和条件图像
-                model_input = torch.cat(
-                    [noisy_images, low_light_images], dim=1)
+            # <--- 同时 accumulate 两个模型
+            with accelerator.accumulate(model, condition_encoder):
+                # 1. 通过 ConditionEncoder 获取条件嵌入
+                # low_light_images 已经是 [-1, 1]
+                encoder_hidden_states = condition_encoder(low_light_images)
+                # encoder_hidden_states: [B, SeqLen, CrossAttnDim]
 
-                # 预测噪声残差
-                noise_pred = model(model_input, timesteps).sample
+                # 2. U-Net 预测噪声 (输入为 noisy_images, 条件为 encoder_hidden_states)
+                # model_input 现在只是 noisy_images
+                noise_pred = model(
+                    noisy_images, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 
-                # 1. 计算 MSE 损失 (预测噪声和实际添加噪声之间的 MSE)
-                loss_mse = F.mse_loss(noise_pred.float(),
-                                      noise.float())  # 确保 float 类型
+                # 3. 计算 MSE 损失
+                loss_mse = F.mse_loss(noise_pred.float(), noise.float())
 
-                # 2. 计算 LPIPS 损失 (如果 LPIPS 模型成功加载)
-                loss_lpips = torch.tensor(0.0).to(accelerator.device)  # 初始化为 0
+                # 4. 计算 LPIPS 损失
+                loss_lpips = torch.tensor(0.0).to(accelerator.device)
                 if lpips_model is not None and args.lambda_lpips > 0:
-                    # 需要估算去噪后的图像 pred_x0
-                    # 使用 scheduler 的 alphas_cumprod
-                    # 确保 alphas_cumprod 在正确的设备上并且形状匹配
                     alphas_cumprod = noise_scheduler.alphas_cumprod.to(
-                        timesteps.device)
+                        timesteps.device)  # 类型和设备已匹配
                     sqrt_alpha_prod = alphas_cumprod[timesteps].sqrt(
                     ).view(-1, 1, 1, 1)
                     sqrt_one_minus_alpha_prod = (
                         1 - alphas_cumprod[timesteps]).sqrt().view(-1, 1, 1, 1)
 
-                    # 计算 pred_x0
-                    # pred_x0 = (noisy_images - sqrt(1 - alpha_prod_t) * noise_pred) / sqrt(alpha_prod_t)
                     pred_x0 = (noisy_images - sqrt_one_minus_alpha_prod *
                                noise_pred) / sqrt_alpha_prod
-
-                    # 将 pred_x0 和 clean_images clamp 到 [-1, 1] 以确保 LPIPS 输入范围正确
                     pred_x0_clamp = torch.clamp(pred_x0, -1.0, 1.0)
                     clean_images_clamp = torch.clamp(clean_images, -1.0, 1.0)
-
-                    # 计算 LPIPS 损失
-                    # LPIPS 模型通常在 fp32 下运行更稳定
                     loss_lpips = lpips_model(
                         pred_x0_clamp.float(), clean_images_clamp.float()).mean()
 
-                # 3. 合并损失
+                # 5. 合并损失
                 loss = loss_mse + args.lambda_lpips * loss_lpips
 
-                # 收集损失用于日志记录 (收集总损失)
-                # accelerator.gather 返回 tensor (主进程) 或 None (其他进程)
                 gathered_loss = accelerator.gather(
                     loss.repeat(args.batch_size))
-                # .mean() 应该在 tensor 上调用
-                if gathered_loss is not None:  # 只有主进程计算 avg_loss
-                    # 确保 gathered_loss 是 tensor
+                if gathered_loss is not None:
                     if isinstance(gathered_loss, torch.Tensor):
                         avg_loss = gathered_loss.mean()
                         train_loss += avg_loss.item() / args.gradient_accumulation_steps
                     else:
-                        # 处理 gather 返回非 Tensor 的情况 (理论上不应发生)
                         logger.warning(
                             f"accelerator.gather returned unexpected type: {type(gathered_loss)}")
-                        avg_loss = torch.tensor(0.0)  # 设置默认值
+                        avg_loss = torch.tensor(0.0)
                 else:
-                    avg_loss = torch.tensor(0.0)  # 其他进程设为0，避免错误
+                    avg_loss = torch.tensor(0.0)
 
-                # 反向传播
                 accelerator.backward(loss)
 
-                # 梯度裁剪
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        model.parameters(), args.max_grad_norm)
+                    # 合并模型参数以进行统一的梯度裁剪
+                    all_parameters = list(
+                        model.parameters()) + list(condition_encoder.parameters())
+                    # 过滤掉不需要梯度的参数 (可选，但良好实践)
+                    parameters_to_clip = [
+                        p for p in all_parameters if p.grad is not None]
+                    if parameters_to_clip:  # 确保有参数需要裁剪
+                        accelerator.clip_grad_norm_(
+                            parameters_to_clip, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # 检查是否是同步和更新步骤
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                # 主进程记录日志
                 if accelerator.is_main_process:
                     current_lr = lr_scheduler.get_last_lr(
                     )[0] if lr_scheduler else args.learning_rate
-                    # --- 修改日志内容 ---
                     logs = {
-                        "loss": train_loss,  # 这是累积的总损失
-                        # 当前 step 的 mse loss
+                        "loss": train_loss,
                         "loss_mse": loss_mse.item() / args.gradient_accumulation_steps if accelerator.is_main_process else 0.0,
-                        "loss_lpips": loss_lpips.item() / args.gradient_accumulation_steps if accelerator.is_main_process and lpips_model is not None and args.lambda_lpips > 0 else 0.0,  # 当前 step 的 lpips loss
+                        "loss_lpips": loss_lpips.item() / args.gradient_accumulation_steps if accelerator.is_main_process and lpips_model is not None and args.lambda_lpips > 0 else 0.0,
                         "lr": current_lr,
                         "epoch": epoch + 1
                     }
                     postfix_dict = {
-                        "loss": f"{train_loss:.4f}",  # 显示累积总损失
-                        "mse": f"{logs['loss_mse']:.4f}",  # 显示当前 mse
-                        "lpips": f"{logs['loss_lpips']:.4f}",  # 显示当前 lpips
+                        "loss": f"{train_loss:.4f}",
+                        "mse": f"{logs['loss_mse']:.4f}",
+                        "lpips": f"{logs['loss_lpips']:.4f}",
                         "lr": f"{current_lr:.6f}",
                         "epoch": epoch + 1
                     }
                     progress_bar.set_postfix(**postfix_dict)
                     accelerator.log(logs, step=global_step)
-                    # --- 结束修改 ---
-                train_loss = 0.0  # 重置累积损失
+                train_loss = 0.0
 
-                # 定期验证 (基于 global_step)
                 if accelerator.is_main_process:
-                    # 验证频率可以基于步数，更精确
-                    # 确保 validation_epochs > 0 且 num_update_steps_per_epoch > 0
                     if args.validation_epochs > 0 and num_update_steps_per_epoch > 0:
                         validation_steps = args.validation_epochs * num_update_steps_per_epoch
                         if global_step % validation_steps == 0 or global_step == args.max_train_steps:
                             logger.info(
                                 f"Running validation at step {global_step} (Epoch {epoch+1})...")
-                            unet = accelerator.unwrap_model(model)  # 获取原始模型
-                            unet.eval()  # 设置为评估模式
 
-                            # 获取未包装的 scheduler config
-                            # noise_scheduler 是 accelerate prepare 之前的原始对象
-                            scheduler_config: dict = noise_scheduler.config  # 添加类型提示
-                            # 显式实例化验证调度器
+                            # 获取原始模型
+                            unet_eval = accelerator.unwrap_model(model)
+                            condition_encoder_eval = accelerator.unwrap_model(
+                                condition_encoder)  # <--- Unwrap cond_enc
+                            unet_eval.eval()
+                            condition_encoder_eval.eval()  # <--- 设置 cond_enc 为评估模式
+
+                            scheduler_config: dict = noise_scheduler.config
                             sampling_scheduler = DDPMScheduler(
                                 **scheduler_config)
-
-                            # 设置采样步数
                             sampling_scheduler.set_timesteps(
                                 args.num_inference_steps)
 
                             val_psnr_list = []
                             val_ssim_list = []
                             generated_images_pil = []
-                            # 使用 eval_dataloader 进行验证
                             val_progress_bar = tqdm(
-                                total=len(eval_dataloader), desc="Validation", leave=False, position=1)
+                                total=len(eval_dataloader), desc="Validation", leave=False, position=1, disable=not accelerator.is_local_main_process)
 
                             for val_step, val_batch in enumerate(eval_dataloader):
-                                low_light_images, clean_images = val_batch
-                                batch_size = low_light_images.shape[0]
+                                low_light_images_val, clean_images_val = val_batch
+                                batch_size_val = low_light_images_val.shape[0]
 
-                                # 初始化随机噪声 latents
+                                # 获取条件嵌入
+                                with torch.no_grad():
+                                    encoder_hidden_states_val = condition_encoder_eval(
+                                        low_light_images_val)
+
                                 latents = torch.randn_like(
-                                    clean_images, device=accelerator.device)
-                                # scale the initial noise by the standard deviation required by the scheduler
+                                    clean_images_val, device=accelerator.device)
                                 latents = latents * sampling_scheduler.init_noise_sigma
 
-                                # 条件采样循环
-                                # 使用 sampling_scheduler 的时间步
                                 timesteps_to_iterate = sampling_scheduler.timesteps
-                                for t in tqdm(timesteps_to_iterate, leave=False, desc="Sampling", position=2):
+                                for t_idx, t in enumerate(tqdm(timesteps_to_iterate, leave=False, desc="Sampling", position=2, disable=not accelerator.is_local_main_process)):
                                     with torch.no_grad():
-                                        # 准备模型输入: [b, 6, H, W]
-                                        # latents 可能需要扩展以匹配模型预期（如果需要）
-                                        model_input = torch.cat(
-                                            [latents, low_light_images], dim=1)
-                                        # timestep 需要是 LongTensor
+                                        # model_input_val 现在只是 latents
                                         timestep_tensor = torch.tensor(
-                                            [t] * batch_size, device=accelerator.device).long()
-                                        noise_pred = unet(
-                                            model_input, timestep_tensor).sample
-                                        # 使用调度器计算上一步的样本
-                                        # scheduler.step 需要 int timestep
-                                        # 将 t 转换为 int
-                                        current_timestep = int(
+                                            [t] * batch_size_val, device=accelerator.device).long()
+                                        noise_pred_val = unet_eval(
+                                            # 输入 latents (即 noisy_sample)
+                                            latents,
+                                            timestep_tensor,
+                                            encoder_hidden_states=encoder_hidden_states_val  # <--- 传递条件嵌入
+                                        ).sample
+
+                                        current_timestep_val = int(
                                             t.item() if isinstance(t, torch.Tensor) else t)
-                                        # DDPMScheduler.step 返回 dataclass DDPMSchedulerOutput
                                         step_output = sampling_scheduler.step(
-                                            noise_pred, current_timestep, latents)
-                                        # Explicitly check type before accessing attribute
+                                            noise_pred_val, current_timestep_val, latents)
+
                                         if isinstance(step_output, DDPMSchedulerOutput):
                                             latents = step_output.prev_sample
                                         else:
-                                            # Handle unexpected return type (e.g., log warning, use default)
                                             logger.warning(
                                                 f"Unexpected type from scheduler step: {type(step_output)}. Using noise_pred as fallback.")
-                                            # Fallback strategy might depend on the scheduler
-                                            latents = noise_pred  # Or some other fallback
+                                            latents = noise_pred_val
 
-                                # latents 现在是增强后的图像 [-1, 1]
-                                enhanced_images = latents
-
-                                # 将图像转换回 [0, 1] 以计算指标和保存
+                                enhanced_images = latents  # [-1, 1]
                                 enhanced_images_0_1 = (
                                     enhanced_images / 2 + 0.5).clamp(0, 1)
-                                clean_images_0_1 = (
-                                    clean_images / 2 + 0.5).clamp(0, 1)
+                                clean_images_0_1_val = (
+                                    clean_images_val / 2 + 0.5).clamp(0, 1)
 
-                                # 计算 PSNR 和 SSIM (在 CPU 上计算更安全)
                                 try:
                                     current_psnr = peak_signal_noise_ratio(
-                                        enhanced_images_0_1.cpu(), clean_images_0_1.cpu()).item()
+                                        enhanced_images_0_1.cpu(), clean_images_0_1_val.cpu()
+                                    ).item()
                                     current_ssim = ssim(
-                                        enhanced_images_0_1.cpu(), clean_images_0_1.cpu()).item()
+                                        enhanced_images_0_1.cpu(), clean_images_0_1_val.cpu()
+                                    ).item()
                                     val_psnr_list.append(current_psnr)
                                     val_ssim_list.append(current_ssim)
                                     val_progress_bar.set_postfix(
                                         PSNR=f"{current_psnr:.2f}", SSIM=f"{current_ssim:.4f}")
                                 except Exception as e:
                                     logger.error(f"计算指标时出错: {e}")
-                                    # 可以选择跳过这个 batch 或记录 NaN
                                     val_psnr_list.append(float('nan'))
                                     val_ssim_list.append(float('nan'))
 
-                                # 保存前 N 个验证图像用于可视化
                                 if len(generated_images_pil) < args.num_validation_images:
-                                    # 从 batch 中安全地选择图像进行可视化
                                     num_to_save = min(
-                                        batch_size, args.num_validation_images - len(generated_images_pil))
+                                        batch_size_val, args.num_validation_images - len(generated_images_pil))
                                     for i in range(num_to_save):
                                         enhanced_pil = transforms.ToPILImage()(
                                             enhanced_images_0_1[i].cpu())
+                                        # low_light_images_val 已经是 [-1, 1]
                                         low_light_pil = transforms.ToPILImage()(
-                                            (low_light_images[i].cpu() / 2 + 0.5).clamp(0, 1))
+                                            (low_light_images_val[i].cpu() / 2 + 0.5).clamp(0, 1))
                                         clean_pil = transforms.ToPILImage()(
-                                            clean_images_0_1[i].cpu())
-                                        # 拼接图像 (low, enhanced, clean)
+                                            clean_images_0_1_val[i].cpu())
+
                                         total_width = low_light_pil.width * 3
                                         max_height = low_light_pil.height
                                         combined_image = Image.new(
@@ -668,12 +725,9 @@ def main():
                                             clean_pil, (low_light_pil.width * 2, 0))
                                         generated_images_pil.append(
                                             combined_image)
-
                                 val_progress_bar.update(1)
-
                             val_progress_bar.close()
 
-                            # 计算平均指标 (过滤掉 NaN 值)
                             valid_psnr = [
                                 p for p in val_psnr_list if not math.isnan(p)]
                             valid_ssim = [
@@ -682,40 +736,27 @@ def main():
                                 len(valid_psnr) if valid_psnr else 0.0
                             avg_ssim = sum(valid_ssim) / \
                                 len(valid_ssim) if valid_ssim else 0.0
-
                             logger.info(
                                 f"Step {global_step} Validation Results: Avg PSNR: {avg_psnr:.4f}, Avg SSIM: {avg_ssim:.4f}")
 
-                            # 记录指标和图像
                             metrics_to_log = {
                                 "val_psnr": avg_psnr, "val_ssim": avg_ssim}
-                            # (low, enhanced, clean)
-                            tracker_key = "validation_enhanced_samples"
-
-                            # 使用 accelerator.log 记录指标
                             accelerator.log(metrics_to_log, step=global_step)
 
-                            # 记录图像到 tracker (tensorboard 或其他)
-                            if generated_images_pil:  # 确保有图像可记录
+                            if generated_images_pil:
+                                tracker_key = "validation_enhanced_samples"
                                 try:
-                                    # 直接让 accelerate 处理 PIL 图像列表
                                     accelerator.log(
-                                        {tracker_key: generated_images_pil},
-                                        step=global_step
-                                    )
+                                        {tracker_key: generated_images_pil}, step=global_step)
                                     logger.info(
                                         f"验证样本图像已记录到 tracker ({args.report_to})")
                                 except Exception as e:
                                     logger.warning(f"无法将验证图像记录到 tracker: {e}")
-                                    # 如果 tracker 记录失败，仍保存到本地文件
-                                    # 这个本地保存的逻辑现在会移到外面，无论如何都执行
 
-                                # --- 新增：总是保存验证样本到本地 ---
                                 sample_dir = os.path.join(
                                     args.output_dir, "validation_samples")
                                 os.makedirs(sample_dir, exist_ok=True)
                                 for idx, img in enumerate(generated_images_pil):
-                                    # 使用更详细的文件名，包含 epoch 和 step
                                     save_filename = os.path.join(
                                         sample_dir, f"epoch-{epoch+1}_step-{global_step}_sample-{idx}.png")
                                     try:
@@ -724,40 +765,31 @@ def main():
                                         logger.error(
                                             f"保存验证样本图像失败 {save_filename}: {save_err}")
                                 logger.info(f"验证样本图像已保存到本地目录 {sample_dir}")
-                                # --- 结束新增代码 ---
 
-                            # 清理 GPU 缓存
-                            del unet  # 删除对 unwrap 模型的引用
+                            del unet_eval, condition_encoder_eval  # 清理
                             torch.cuda.empty_cache()
-                            model.train()  # 验证结束后切回训练模式
-                    else:  # validation_epochs <= 0 or num_update_steps_per_epoch <= 0
-                        # Ensure validation runs at the end if step-based validation is disabled/problematic
-                        if global_step == args.max_train_steps:
-                            logger.warning(
-                                "Validation step calculation issue or validation_epochs <= 0. Running validation at the final step.")
-                            # ... (复制粘贴上面的验证逻辑或将其重构为函数) ...
-                            pass  # 避免重复代码，实际应用中应重构为一个函数
+                            model.train()  # 切回训练模式
+                            condition_encoder.train()  # 切回训练模式
 
-                # 定期保存检查点 (检查点逻辑移到验证之后，确保保存的是 train 模式的模型状态)
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                     save_dir = os.path.join(
                         args.output_dir, f"checkpoint-{global_step}")
+                    # Accelerator 会保存所有 prepare过的模型和优化器状态
                     accelerator.save_state(save_dir)
                     logger.info(f"已保存检查点到 {save_dir}")
-                    # 管理检查点数量
+
                     if args.checkpoints_total_limit is not None:
                         ckpts = sorted(
-                            [d for d in os.listdir(
-                                args.output_dir) if d.startswith("checkpoint") and os.path.isdir(os.path.join(args.output_dir, d))],  # 确保是目录
+                            [d for d in os.listdir(args.output_dir) if d.startswith(
+                                "checkpoint") and os.path.isdir(os.path.join(args.output_dir, d))],
                             key=lambda x: int(x.split('-')[1])
                         )
                         if len(ckpts) > args.checkpoints_total_limit:
-                            num_to_remove = len(
-                                ckpts) - args.checkpoints_total_limit
-                            for old_ckpt in ckpts[:num_to_remove]:  # 删除最旧的
+                            num_to_remove = len(ckpts) - \
+                                args.checkpoints_total_limit
+                            for old_ckpt in ckpts[:num_to_remove]:
                                 old_ckpt_path = os.path.join(
                                     args.output_dir, old_ckpt)
-                                # 确保删除的是目录
                                 if os.path.isdir(old_ckpt_path):
                                     import shutil
                                     try:
@@ -768,34 +800,35 @@ def main():
                                         logger.error(
                                             f"删除检查点失败 {old_ckpt_path}: {e}")
 
-            # 超过最大步数则停止
             if global_step >= args.max_train_steps:
                 break
 
-        # epoch 结束
         accelerator.wait_for_everyone()
-
-        # # Epoch 结束时的验证逻辑（如果需要）
-        # if accelerator.is_main_process and (epoch + 1) % args.validation_epochs == 0:
-        #      # 这里可以放入基于 epoch 的验证逻辑，如果不想基于 step
-        #      pass
-
-        # 超过最大步数则停止外部循环
         if global_step >= args.max_train_steps:
             logger.info("达到最大训练步数，停止训练。")
             break
 
-    # 训练结束
     accelerator.end_training()
     logger.info("训练完成")
 
-    # 保存最终模型
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(model)
-        # 保存为 diffusers 格式
-        save_path_final = os.path.join(args.output_dir, "unet_final")
-        unet.save_pretrained(save_path_final)
-        logger.info(f"最终模型已保存到 {save_path_final}")
+        # 保存最终模型 (U-Net 和 ConditioningEncoder)
+        # Unwrap 模型
+        unet_final = accelerator.unwrap_model(model)
+        condition_encoder_final = accelerator.unwrap_model(condition_encoder)
+
+        # 保存 U-Net
+        save_path_unet_final = os.path.join(args.output_dir, "unet_final")
+        unet_final.save_pretrained(save_path_unet_final)
+        logger.info(f"最终 U-Net 模型已保存到 {save_path_unet_final}")
+
+        # 保存 ConditioningEncoder (使用 torch.save)
+        save_path_cond_enc_final = os.path.join(
+            args.output_dir, "condition_encoder_final.pth")
+        torch.save(condition_encoder_final.state_dict(),
+                   save_path_cond_enc_final)
+        logger.info(
+            f"最终 ConditioningEncoder 模型已保存到 {save_path_cond_enc_final}")
 
 
 if __name__ == "__main__":
